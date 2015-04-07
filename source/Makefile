@@ -22,10 +22,10 @@
 #--------------------------------------------------------------------------
 #  mpi defs 
 #--------------------------------------------------------------------------
-         CPP      = /usr/bin/cpp 
+         CPP      = cpp 
          CPPFLAGS = $(DEF_FLAGS)
 #         FC       = ifort
-         FC        = mpiifort
+         FC        = mpifort
          DEBFLGS  = 
          OPT      = #-g
          CLIB     = 
@@ -80,7 +80,6 @@ clean:
 
 clobber:	clean
 		/bin/rm -f *.f90 *.o nhwave
-
 
 
 
