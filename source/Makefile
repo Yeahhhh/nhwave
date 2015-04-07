@@ -42,8 +42,8 @@
 #--------------------------------------------------------------------------
 #  Libraries           
 #--------------------------------------------------------------------------
-         LIBS  = -L/home/gma/hypre/parallel/lib -lHYPRE
-         INCS  = -I/home/gma/hypre/parallel/include
+         LIBS  = -L$(HOME)/hypre/lib -lHYPRE
+         INCS  = -I$(HOME)/hypre/include
 #--------------------------------------------------------------------------
 #  Preprocessing and Compilation Directives
 #--------------------------------------------------------------------------
@@ -80,7 +80,6 @@ clean:
 
 clobber:	clean
 		/bin/rm -f *.f90 *.o nhwave
-
 
 
 
