@@ -3,18 +3,6 @@ a 2015 GPU Hackathon code
 	port to GPU with OpenACC
 
 
-reference
-	https://www.olcf.ornl.gov/training-event/2015-gpu-hackathons/	2015 GPU Hackathons
-	http://on-demand.gputechconf.com/gtc/2015/video/S5515.html	A summary of the first GPU hackathon
-
-
-run on smic
-
-module add openmpi/1.8.4/INTEL-14.0.2 pgi/14.3
-
-
-
-
 
 
 

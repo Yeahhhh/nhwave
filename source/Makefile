@@ -26,6 +26,7 @@
          CPPFLAGS = $(DEF_FLAGS)
 #         FC       = ifort
          FC        = mpifort
+#         FC        = mpif90t
          DEBFLGS  = 
          OPT      = #-g
          CLIB     = 

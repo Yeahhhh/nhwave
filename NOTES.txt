@@ -1,0 +1,78 @@
+reference
+	https://docs.google.com/a/tigers.lsu.edu/document/d/1EjVzHDIjpi6re07FXiM3mcDjOtLqvpm1h7Hj6Oha518/edit?usp=sharing_eid
+
+	https://www.olcf.ornl.gov/training-event/2015-gpu-hackathons/	2015 GPU Hackathons
+	http://on-demand.gputechconf.com/gtc/2015/video/S5515.html	A summary of the first GPU hackathon
+
+	https://nvidia.qwiklab.com/ QopenACC Qwik Labs
+
+	http://devblogs.nvidia.com/parallelforall/amgx-multi-grid-accelerated-linear-solvers-industrial-applications/			AmgX and HYPRE AMG
+
+
+
+todo
+	switch library (solving the Poisson equation)
+		before:		HYPRE	http://acts.nersc.gov/hypre/
+		after:		AmgX	https://developer.nvidia.com/amgx ???
+				CuPoisson	https://code.google.com/p/cupoisson/ ???
+
+
+
+Members
+	Roberto Gomperts
+	Omar Padron
+
+
+
+
+procedure
+
+
+	run on Chester
+
+	run on smic
+		module add openmpi/1.8.4/INTEL-14.0.2 pgi/14.3
+
+	1. switch to PGI fortran
+	2. sanity check with pgfortran -acc. Verified by Jian
+	2. profiling
+
+
+
+
+
+
+
+
+Jian:
+
+
+The HYPRE library installed on our local system is compiled with Intel compiler.
+Although there is no compilation error the code generates NaNs when we ran it.
+We are still looking into the problem.
+
+
+
+
+
+
+
+
+Roberto Gomperts to Jian Tao:
+
+Meanwhile have you looked into AmgX? I am cc:ing Nikolai from NVIDIA whao is
+going to be at the Hackathon and has had some experience mapping Poisson
+equations from HYPRE to AmgX.
+
+These are Nikolai’s remarks:
+HYPRE can be compiled with PGI but in general, I would recommend to use AmgX
+API instead of HYPRE API. There are a lot of similarities between them so it
+should be relatively easy to switch from HYPRE to AmgX. A typical API sequence
+in AmgX is that you pass host or device pointers to matrix/rhs, specify solver
+configuration, run setup/solve phases. AmgX supports standard CSR format for
+matrices, for the configuration we would have to see what’s used in HYPRE and
+mirror that using AmgX options. We also have an optimized configuration
+specifically for the Poisson equation solver.
+
+
+
