@@ -7176,13 +7176,13 @@
      use global
      use input_util
 # if defined (INTEL)
-     use IFPORT, only: rand
+!     use IFPORT, only: rand
 # endif
      implicit none
      character(len=80) :: FILE_NAME
      real(SP) :: Segma,Celerity,Wave_Length,Wave_Number,  &
                  Fk,Fkdif,Theta_Calc,Wnumy,tmp,tmp1,DFreq, &
-                 Freq_Peak,gam,sa,sb,SumInt,A_Jon
+                 Freq_Peak,gam,sa,sb,SumInt,A_Jon, rand
      integer :: line,ierr,Iter,i,j
  
      ! log and error file

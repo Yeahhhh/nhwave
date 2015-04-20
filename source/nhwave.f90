@@ -5640,12 +5640,11 @@
 !---------------------------------------------------
      use global
      use input_util
-     use IFPORT, only: rand
      implicit none
      character(len=80) :: FILE_NAME
      real(SP) :: Segma,Celerity,Wave_Length,Wave_Number,  &
                  Fk,Fkdif,Theta_Calc,Wnumy,tmp,tmp1,DFreq, &
-                 Freq_Peak,gam,sa,sb,SumInt,A_Jon
+                 Freq_Peak,gam,sa,sb,SumInt,A_Jon, rand
      integer :: line,ierr,Iter,i,j
  
      ! log and error file
@@ -5947,7 +5946,7 @@
        ! random phase for each component
        do j = 1,NumFreq
        do i = 1,NumDir
-         Random_Phs(i,j) = rand()*2.0*pi
+         Random_Phs(i,j) = rand(0)*2.0*pi
        enddo
        enddo
      ENDIF
@@ -6024,14 +6023,10 @@
        CALL GET_Float_VAL(Sponge_East_Width,FILE_NAME,'Sponge_East_Width',line)
        CALL GET_Float_VAL(Sponge_South_Width,FILE_NAME,'Sponge_South_Width',line)
        CALL GET_Float_VAL(Sponge_North_Width,FILE_NAME,'Sponge_North_Width',line)
-       CALL GET_Float_VAL(R_Sponge,FILE_NAME,'R_Sponge',line)
-       CALL GET_Float_VAL(A_Sponge,FILE_NAME,'A_Sponge',line)
        if(myid.eq.0) WRITE(3,'(A19,F6.3)')'Sponge_West_Width= ', Sponge_West_Width
        if(myid.eq.0) WRITE(3,'(A19,F6.3)')'Sponge_East_Width= ', Sponge_East_Width
        if(myid.eq.0) WRITE(3,'(A20,F6.3)')'Sponge_South_Width= ', Sponge_South_Width
        if(myid.eq.0) WRITE(3,'(A20,F6.3)')'Sponge_North_Width= ', Sponge_North_Width
-       if(myid.eq.0) WRITE(3,'(A10,F6.3)')'R_Sponge= ', R_Sponge
-       if(myid.eq.0) WRITE(3,'(A10,F6.3)')'A_Sponge= ', A_Sponge
      ENDIF
 
      ! wave average control
@@ -7397,8 +7392,11 @@
           enddo
           enddo
 
-          ! no negative production at the surface
-          if(k==Kend.and.Prod_s(i,j,k)<0.0) Prod_s(i,j,k) = Zero
+          !! no negative production at the surface
+          !if(k==Kend.and.Prod_s(i,j,k)<0.0) Prod_s(i,j,k) = Zero
+
+          ! Do not allow negative production
+          if(Prod_s(i,j,k)<0.0) Prod_s(i,j,k) = Zero
 
         endif
       elseif(ke_model==3) then
@@ -7601,27 +7599,27 @@
       else
         Zdis = 0.5*dsig(Kbeg)*D(i,j)
 
-!        X0 = 0.05
-!        Iter = 0
-!
-!        Xa = dlog(9.0*Umag*Zdis/Visc)
-! 10     Xn = X0+(0.41-X0*(Xa+dlog(X0)))/(1.0+0.41/X0)
-!        if(Iter>=20) then
-!          write(*,*) 'Iteration exceeds 20 steps',i,j,Umag
-!        endif
-!        if(dabs((Xn-X0)/X0)>1.e-8.and.Xn>0.0) then
-!          X0 = Xn
-!          Iter = Iter+1
-!          goto 10
-!        else
-!          FricU = Xn*Umag
-!        endif
+        X0 = 0.05
+        Iter = 0
 
-        if(Ibot==1) then
-          FricU = sqrt(Cd0)*Umag
-        else
-          FricU = Umag/(1./Kappa*log(30.*Zdis/Zob))
+        Xa = dlog(9.0*Umag*Zdis/Visc)
+ 10     Xn = X0+(0.41-X0*(Xa+dlog(X0)))/(1.0+0.41/X0)
+        if(Iter>=20) then
+          write(*,*) 'Iteration exceeds 20 steps',i,j,Umag
         endif
+        if(dabs((Xn-X0)/X0)>1.e-8.and.Xn>0.0) then
+          X0 = Xn
+          Iter = Iter+1
+          goto 10
+        else
+          FricU = Xn*Umag
+        endif
+
+!        if(Ibot==1) then
+!          FricU = sqrt(Cd0)*Umag
+!        else
+!          FricU = Umag/(1./Kappa*log(30.*Zdis/Zob))
+!        endif
 
         Tkeb = FricU**2/sqrt(cmiu)
         Epsb = FricU**3/(Kappa*Zdis)
@@ -7701,7 +7699,11 @@
       if(D(i,j)>=Dmin.and.Mask(i,j)==1) then
         Tke(i,j,k) = DTke(i,j,k)/D(i,j)
         Eps(i,j,k) = DEps(i,j,k)/D(i,j)
-        CmuVt(i,j,k) = Cmiu*Tke(i,j,k)**2/Eps(i,j,k)
+        if(Tke(i,j,k)<1.e-6.or.Eps(i,j,k)<1.e-6) then
+          CmuVt(i,j,k) = Cmut_min
+        else
+          CmuVt(i,j,k) = Cmiu*Tke(i,j,k)**2/Eps(i,j,k)
+        endif
       else
         Tke(i,j,k) = Tke_min
         Eps(i,j,k) = Eps_min

@@ -15,7 +15,7 @@
 #         FLAG_6 = -DBUBBLE
 #         FLAG_7 = -DSEDIMENT
 #         FLAG_8 = -DVEGETATION
-         FLAG_9 = -DINTEL
+#         FLAG_9 = -DINTEL
 #	  FLAG_10 = -DBALANCE2D
 #	 FLAG_12 = -DTWOLAYERSLIDE
 #	 FLAG_13 = -DCORALREEF
@@ -43,8 +43,13 @@
 #--------------------------------------------------------------------------
 #  Libraries           
 #--------------------------------------------------------------------------
-         LIBS  = -L$(HOME)/hypre/lib -lHYPRE
-         INCS  = -I$(HOME)/hypre/include
+#	HYPREINSTALL = /home-2/ncsa01/hyprelib_intel15/
+#	HYPREINSTALL = /home-2/ncsa01/hyprelib_intel15_O0debug/
+	HYPREINSTALL = /home-2/ncsa01/hyprelib_pgi153/
+#	HYPREINSTALL = /home-2/ncsa01/hyprelib_pgi153_O0debug/
+
+	 LIBS  = -L$(HYPREINSTALL)/lib -lHYPRE
+	 INCS  = -I$(HYPREINSTALL)/include
 #--------------------------------------------------------------------------
 #  Preprocessing and Compilation Directives
 #--------------------------------------------------------------------------
