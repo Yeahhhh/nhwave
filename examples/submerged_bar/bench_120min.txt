@@ -1,0 +1,82 @@
+ ----------------- STATISTICS ----------------
+  TIME        DT         DT_CONSTRAINT
+  0.1199E+03  0.4781E-02 COURANT
+ MassVolume  Energy      MaxEta      MinEta      MaxU       MaxV       M                                                                         axW       MaxS       MinS
+  0.2410E+00 -0.4401E+03  0.2551E-01 -0.1734E-01  0.2736E+00  0.0000E+00                                                                           0.1195E+00         NaN  0.6925-309
+   Printing file No. 5997  TIME/TOTAL:  119.943 / 120.000
+ ----------------- STATISTICS ----------------
+  TIME        DT         DT_CONSTRAINT
+  0.1200E+03  0.4787E-02 COURANT
+ MassVolume  Energy      MaxEta      MinEta      MaxU       MaxV       M                                                                         axW       MaxS       MinS
+  0.2410E+00 -0.4401E+03  0.2552E-01 -0.1736E-01  0.2750E+00  0.0000E+00                                                                           0.1199E+00         NaN  0.6925-309
+   Printing file No. 5998  TIME/TOTAL:  119.962 / 120.000
+ ----------------- STATISTICS ----------------
+  TIME        DT         DT_CONSTRAINT
+  0.1200E+03  0.4793E-02 COURANT
+ MassVolume  Energy      MaxEta      MinEta      MaxU       MaxV       M                                                                         axW       MaxS       MinS
+  0.2410E+00 -0.4401E+03  0.2555E-01 -0.1736E-01  0.2763E+00  0.0000E+00                                                                           0.1203E+00         NaN  0.6925-309
+   Printing file No. 5999  TIME/TOTAL:  119.981 / 120.000
+ ----------------- STATISTICS ----------------
+  TIME        DT         DT_CONSTRAINT
+  0.1200E+03  0.4799E-02 COURANT
+ MassVolume  Energy      MaxEta      MinEta      MaxU       MaxV       M                                                                         axW       MaxS       MinS
+  0.2410E+00 -0.4401E+03  0.2558E-01 -0.1736E-01  0.2775E+00  0.0000E+00                                                                           0.1210E+00         NaN  0.6925-309
+   Printing file No. 6000  TIME/TOTAL:  120.001 / 120.000
+ Normal Termination!
+ Simulation takes    6485.565999999642      seconds
+
+real    108m7.318s
+user    86m21.129s
+sys     7m10.622s
+
+Threads   : 1
+
+
+
+
+
+Profile output - Tue Apr 21 20:56:16 PDT 2015
+Program                           : ../../source/nhwave
+Datafile                          : pgprof.out
+Process                           : 0
+Total Time for Process            : 6,486.119364 secs
+Sort by max time
+Select all
+
+
+                                               Routine Source   Line
+         Calls  Time(%)                           Name File    No.
+
+       506,000       15                     delxfun_3d hotspot_XXFun.f90      1
+       506,000       13                     delyfun_3d hotspot_XXFun.f90     55
+        50,600       12              hypre_pres_solver hotspot_hypre_pres_solver.f90      2
+21,026,316,221       11                        limiter nhwave.f90  1,843
+        12,000       11                         probes hotspot_probes.f90      2
+        50,600        6              generate_coef_rhs hotspot_generate_coef_rhs.f90      3
+       151,800        6                     delzfun_3d hotspot_XXFun.f90    106
+       506,000        4                 construct_3d_y nhwave.f90  1,191
+       506,000        3                 construct_3d_x nhwave.f90  1,137
+         6,001        2                      putfile2d nhwave.f90  2,546
+       506,000        2                            hll nhwave.f90  1,695
+        50,600        2                      get_omega nhwave.f90    815
+        50,600        1                      eval_duvw nhwave.f90    322
+        50,600        1            fluxes_at_faces_hll nhwave.f90  1,627
+        25,300        1                    update_vars nhwave.f90  3,413
+        50,600        1                sigma_transform nhwave.f90  5,599
+       151,800        1                 construct_3d_z nhwave.f90  1,219
+       101,201        1                         vel_bc nhwave.f90  2,782
+       151,800        1                     delxfun_2d nhwave.f90  1,281
+        50,600        1           projection_corrector nhwave.f90    168
+        50,600        1  interpolate_velocity_to_faces nhwave.f90    736
+        50,600        1                   construction nhwave.f90  1,043
+       101,200        0                     wave_speed nhwave.f90  1,767
+        50,600        0                 sponge_damping nhwave.f90  5,566
+       151,800        0                     delyfun_2d nhwave.f90  1,322
+         6,000        0                        preview nhwave.f90  2,437
+       657,803        0                    phi_3d_exch nhwave.f90  5,960
+       101,200        0                        get_uvw nhwave.f90    979
+        50,600        0                        flux_bc nhwave.f90  1,366
+       101,200        0                 construct_2d_y nhwave.f90  1,165
+       101,200        0                 construct_2d_x nhwave.f90  1,111
+        50,600        0                 poisson_solver nhwave.f90    219
+        25,300        0                    estimate_dt nhwave.f90  2,694

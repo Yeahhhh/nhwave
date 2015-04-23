@@ -1,4 +1,3 @@
-     program NH_WAVE
 !--------------------------------------------------------
 !
 !    Nonhydrostatic WAVE dynamics
@@ -8,7 +7,11 @@
 !    Last update: 14/08/2011, parallel implementation
 !
 !-------------------------------------------------------
+
+
+     program NH_WAVE
      use global
+     use timing
      implicit none
      integer :: j,Istage
      real(SP) :: tbegin,tend
@@ -211,7 +214,26 @@
      call MPI_FINALIZE(ier)
 # endif
 
+
+     call PrintTimers
+
      end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # if defined (BALANCE2D)
      subroutine eval_balance
@@ -562,8 +584,8 @@
      if(n_suth.eq.MPI_PROC_NULL) then
 # endif
      do k = Kbeg,Kend
-     do i = Ibeg,Iend
-       do j = 1,Nghost
+     do j = 1,Nghost
+       do i = Ibeg,Iend
          P(i,Jbeg-j,k) = P(i,Jbeg+j-1,k)
        enddo
      enddo
@@ -576,8 +598,8 @@
      if(n_nrth.eq.MPI_PROC_NULL) then
 # endif
      do k = Kbeg,Kend
+     do j = 1,Nghost
      do i = Ibeg,Iend
-       do j = 1,Nghost
          P(i,Jend+j,k) = P(i,Jend-j+1,k)
        enddo
      enddo
@@ -593,534 +615,9 @@
      end subroutine poisson_solver
 
 
-     subroutine hypre_pres_solver
-!---------------------------------------------
-!    solve pressure using hypre package
-!    called by
-!       poisson_solver
-!    Last update: 22/08/2011, Gangfeng Ma
-!---------------------------------------------
-# if defined (PARALLEL)
-     use global
-     implicit none
-     integer, parameter :: ndim=3
-     integer, parameter :: nentries=15
-     integer :: i,j,k,n,ivalues,nvalues,neq,ientry,num_iterations,  &
-                precond_id,n_pre,n_post,ierr
-     integer*8 :: grid,stencil,matrix,vec_b,vec_x,solver,precond
-     integer :: i_glob(Mloc),j_glob(Nloc),k_glob(Kloc)
-     integer :: ilower(ndim),iupper(ndim),offsets(nentries,ndim),stencil_indices(nentries), &
-                periodic_shift(ndim)
-     real(SP) :: final_res_norm
-     real(SP), dimension(:), allocatable :: values,Phi
-     integer, dimension(:,:,:), allocatable :: indx 
-     data ((offsets(i,j),j=1,ndim),i=1,nentries)/0,0,0,1,0,0,0,1,0,0,-1,1,-1,0,1,  &
-             0,0,1,1,0,1,0,1,1,-1,0,0,0,-1,0,  &
-             0,1,-1,1,0,-1,0,0,-1,-1,0,-1,0,-1,-1/
-
-     ! set up a three dimensional grid
-     call HYPRE_StructGridCreate(MPI_COMM_WORLD,ndim,grid,ierr)
-
-     ! global indices
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       i_glob(i) = npx*(Iend-Ibeg+1)+i-Nghost
-       j_glob(j) = npy*(Jend-Jbeg+1)+j-Nghost
-       k_glob(k) = k-Nghost
-     enddo
-     enddo
-     enddo
-
-     ilower(1) = i_glob(Ibeg)
-     ilower(2) = j_glob(Jbeg)
-     ilower(3) = k_glob(Kbeg)
-     iupper(1) = i_glob(Iend)
-     iupper(2) = j_glob(Jend)
-     iupper(3) = k_glob(Kend)
-
-     call HYPRE_StructGridSetExtents(grid,ilower,iupper,ierr)
-
-     if(PERIODIC_X.or.PERIODIC_Y) then
-       if(PERIODIC_X) then
-         periodic_shift(1) = Mglob
-       else
-         periodic_shift(1) = 0
-       endif
-       if(PERIODIC_Y) then
-         periodic_shift(2) = Nglob
-       else
-         periodic_shift(2) = 0
-       endif
-       periodic_shift(3) = 0
-       call HYPRE_StructGridSetPeriodic(grid,periodic_shift,ierr)
-     endif
-
-     call HYPRE_StructGridAssemble(grid,ierr)
-
-     ! define the discretization stencil
-     call HYPRE_StructStencilCreate(ndim,nentries,stencil,ierr)
-
-     do ientry = 1,nentries
-       call HYPRE_StructStencilSetElement(stencil,(ientry-1),offsets(ientry,:),ierr)
-     enddo
-
-     ! create matrix object
-     call HYPRE_StructMatrixCreate(MPI_COMM_WORLD,grid,stencil,matrix,ierr)
-
-     call HYPRE_StructMatrixInitialize(matrix,ierr)
-
-     ! set the matrix coefficient
-     do i = 1,nentries
-       stencil_indices(i) = i-1
-     enddo
-
-     allocate(indx(Mloc,Nloc,Kloc))
- 
-     neq = 0
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       neq = neq+1
-       indx(i,j,k) = neq
-     enddo
-     enddo
-     enddo
-    
-     nvalues = (Iend-Ibeg+1)*(Jend-Jbeg+1)*(Kend-Kbeg+1)*nentries
-     allocate(values(nvalues))
-
-     ivalues = 0
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       do n = 1,nentries
-         ivalues = ivalues+1
-         values(ivalues) = Coef(indx(i,j,k),n)
-       enddo
-     enddo
-     enddo
-     enddo
-
-     call HYPRE_StructMatrixSetBoxValues(matrix,ilower,iupper,nentries,  &
-                                  stencil_indices,values,ierr) 
-     call HYPRE_StructMatrixAssemble(matrix,ierr)
-     !call HYPRE_StructMatrixPrint(matrix,zero,ierr)
-
-     ! set up struct vectors for b and x
-     call HYPRE_StructVectorCreate(MPI_COMM_WORLD,grid,vec_b,ierr)
-     call HYPRE_StructVectorCreate(MPI_COMM_WORLD,grid,vec_x,ierr)
-
-     call HYPRE_StructVectorInitialize(vec_b,ierr)
-     call HYPRE_StructVectorInitialize(vec_x,ierr)
-
-     ! set the vector coefficients
-     call HYPRE_StructVectorSetBoxValues(vec_b,ilower,iupper,Rhs,ierr)   
-     call HYPRE_StructVectorAssemble(vec_b,ierr)     
-     !call HYPRE_StructVectorPrint(vec_b,zero,ierr)
-
-     ! initial guess
-     allocate(Phi(neqns))
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       Phi(indx(i,j,k)) = P(i,j,k)
-     enddo
-     enddo
-     enddo
-     
-     call HYPRE_StructVectorSetBoxValues(vec_x,ilower,iupper,Phi,ierr)
-     call HYPRE_StructVectorAssemble(vec_x,ierr)
-     !call HYPRE_StructVectorPrint(vec_x,zero,ierr)
-
-     ! set up and use a solver
-     call HYPRE_StructGMRESCreate(MPI_COMM_WORLD,solver,ierr)
-     call HYPRE_StructGMRESSetMaxIter(solver,itmax,ierr)
-     call HYPRE_StructGMRESSetTol(solver,tol,ierr)
-     call HYPRE_StructGMRESSetPrintLevel(solver,0,ierr)
-     call HYPRE_StructGMRESSetLogging(solver,0,ierr)
-
-     ! use symmetric SMG as preconditioner
-     n_pre = 1; n_post = 1
-     call HYPRE_StructSMGCreate(MPI_COMM_WORLD,precond,ierr)
-     call HYPRE_StructSMGSetMemoryUse(precond,0,ierr)
-     call HYPRE_StructSMGSetMaxIter(precond,1,ierr)
-     call HYPRE_StructSMGSetTol(precond,0.0,ierr)
-     call HYPRE_StructSMGSetNumPreRelax(precond,n_pre,ierr)
-     call HYPRE_StructSMGSetNumPostRelax(precond,n_post,ierr)
-     call HYPRE_StructSMGSetLogging(precond,0,ierr)
-
-     ! set up preconditioner
-     precond_id = 0
-     call HYPRE_StructGMRESSetPrecond(solver,precond_id,precond,ierr)
-     
-     ! do the setup
-     call HYPRE_StructGMRESSetup(solver,matrix,vec_b,vec_x,ierr)
- 
-     ! do the solve
-     call HYPRE_StructGMRESSolve(solver,matrix,vec_b,vec_x,ierr)
-
-     ! get results
-     call HYPRE_StructVectorGetBoxValues(vec_x,ilower,iupper,Phi,ierr)
-
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       P(i,j,k) = Phi(indx(i,j,k))
-     enddo
-     enddo
-     enddo
-
-     ! get some info
-     !call HYPRE_StructGMRESGetFinalRelati(solver,final_res_norm,ierr)
-     !call HYPRE_StructGMRESGetNumIteratio(solver,num_iterations,ierr);
-     !
-     !if(myid.eq.0) then
-     !  write(*,*)'Iterations = ',num_iterations
-     !  write(*,*)'Final Relative Residual Norm = ',final_res_norm
-     !endif
-
-     ! free memory
-     call HYPRE_StructGridDestroy(grid,ierr)
-     call HYPRE_StructStencilDestroy(stencil,ierr)
-     call HYPRE_StructMatrixDestroy(matrix,ierr)
-     call HYPRE_StructVectorDestroy(vec_b,ierr)
-     call HYPRE_StructVectorDestroy(vec_x,ierr)
-     call HYPRE_StructGMRESDestroy(solver,ierr)
-     call HYPRE_StructSMGDestroy(precond,ierr)
-
-     deallocate(indx)
-     deallocate(values)
-     deallocate(Phi)
-
-# endif
-     return
-     end subroutine hypre_pres_solver
 
 
-     subroutine generate_coef_rhs
-!---------------------------------------------
-!    Generate coefficient matrix and rhs
-!    Called by 
-!       poisson_solver
-!    Last update: 24/03/2011, Gangfeng Ma
-!--------------------------------------------
-     use global
-     implicit none
-     integer :: i,j,k,neq,n,ic
-     real(SP), dimension(:,:,:), allocatable :: DelxS,DelyS,DelzS,A1
-     integer,  dimension(:,:,:), allocatable :: indx
 
-     allocate(DelxS(Mloc,Nloc,Kloc1))
-     allocate(DelyS(Mloc,Nloc,Kloc1))
-     allocate(DelzS(Mloc,Nloc,Kloc1))
-     allocate(A1(Mloc,Nloc,Kloc1))
-     allocate(indx(Mloc,Nloc,Kloc))
-
-     DelxS = Zero
-     DelyS = Zero
-     DelzS = Zero
-     A1 = Zero
-     do k = Kbeg,Kend1
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       DelxS(i,j,k) = (1.-sig(k))/D(i,j)*DelxH(i,j)-sig(k)/D(i,j)*DelxEta(i,j)
-       DelyS(i,j,k) = (1.-sig(k))/D(i,j)*DelyH(i,j)-sig(k)/D(i,j)*DelyEta(i,j)
-       DelzS(i,j,k) = 1./D(i,j)
-
-       A1(i,j,k) = DelxS(i,j,k)*DelxS(i,j,k)+DelyS(i,j,k)*DelyS(i,j,k)+  &
-            DelzS(i,j,k)*DelzS(i,j,k)
-     enddo
-     enddo
-     enddo
-   
-     ! generate coefficient matrix
-     neq = 0
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       neq = neq+1
-       indx(i,j,k) = neq
-     enddo
-     enddo 
-     enddo
-
-     ! generate source term 
-     Rhs = Zero
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       Rhs(indx(i,j,k)) = -((Uf(i+1,j,k)-Uf(i-1,j,k))/(2.0*dx)+(U(i,j,k)-U(i,j,k-1))/(0.5*(dsig(k)+dsig(k-1)))*  &
-              DelxS(i,j,k)+(Vf(i,j+1,k)-Vf(i,j-1,k))/(2.0*dy)+(V(i,j,k)-V(i,j,k-1))/(0.5*(dsig(k)+dsig(k-1)))*  &
-              DelyS(i,j,k)+(W(i,j,k)-W(i,j,k-1))/(0.5*(dsig(k)+dsig(k-1)))*DelzS(i,j,k)-SourceC(i,j))*Rho0/dt
-     enddo
-     enddo
-     enddo
-
-     Coef = Zero
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       Coef(indx(i,j,k),1) = (2./(dx*dx)+2./(dy*dy)+A1(i,j,k)/(0.5*(dsig(k)+dsig(k-1))*dsig(k))+  &
-                A1(i,j,k)/(0.5*(dsig(k)+dsig(k-1))*dsig(k-1)))
-       Coef(indx(i,j,k),2) = -1./(dx*dx)
-       Coef(indx(i,j,k),3) = -1./(dy*dy)
-       Coef(indx(i,j,k),4) = (DelyS(i,j-1,k)/(2.*dy*(dsig(k)+dsig(k-1)))+DelyS(i,j,k)/(2.*dy*(dsig(k)+dsig(k-1))))   
-       Coef(indx(i,j,k),5) = (DelxS(i-1,j,k)/(2.*dx*(dsig(k)+dsig(k-1)))+DelxS(i,j,k)/(2.*dx*(dsig(k)+dsig(k-1))))
-       Coef(indx(i,j,k),6) = -A1(i,j,k)/(0.5*(dsig(k)+dsig(k-1))*dsig(k))
-       Coef(indx(i,j,k),7) = -(DelxS(i+1,j,k)/(2.*dx*(dsig(k)+dsig(k-1)))+DelxS(i,j,k)/(2.*dx*(dsig(k)+dsig(k-1))))
-       Coef(indx(i,j,k),8) = -(DelyS(i,j+1,k)/(2.*dy*(dsig(k)+dsig(k-1)))+DelyS(i,j,k)/(2.*dy*(dsig(k)+dsig(k-1))))
-       Coef(indx(i,j,k),9) = -1./(dx*dx)
-       Coef(indx(i,j,k),10) = -1./(dy*dy)
-       Coef(indx(i,j,k),11) = (DelyS(i,j+1,k)/(2.*dy*(dsig(k)+dsig(k-1)))+DelyS(i,j,k)/(2.*dy*(dsig(k)+dsig(k-1))))
-       Coef(indx(i,j,k),12) = (DelxS(i+1,j,k)/(2.*dx*(dsig(k)+dsig(k-1)))+DelxS(i,j,k)/(2.*dx*(dsig(k)+dsig(k-1))))
-       Coef(indx(i,j,k),13) = -A1(i,j,k)/(0.5*(dsig(k)+dsig(k-1))*dsig(k-1))
-       Coef(indx(i,j,k),14) = -(DelxS(i-1,j,k)/(2.*dx*(dsig(k)+dsig(k-1)))+DelxS(i,j,k)/(2.*dx*(dsig(k)+dsig(k-1))))
-       Coef(indx(i,j,k),15) = -(DelyS(i,j-1,k)/(2.*dy*(dsig(k)+dsig(k-1)))+DelyS(i,j,k)/(2.*dy*(dsig(k)+dsig(k-1))))
-     enddo
-     enddo
-     enddo
-
-     ! fyshi added boundary conditions at masks face 02/15/2013
-     do i = Ibeg+1,Iend-1
-     do j = Jbeg+1,Jend-1
-     do k = Kbeg,Kend
-       if(mask(i,j)==0) then
-         ! left 
-         if(mask(i+1,j)==1) then
-           ic = indx(I+1,j,k)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,9)
-           Coef(ic,6) = Coef(ic,6)+Coef(ic,5)
-           Coef(ic,13) = Coef(ic,13)+Coef(ic,14)
-           Coef(ic,9) = Zero
-           Coef(ic,5) = Zero
-           Coef(ic,14) = Zero
-         ! right 
-         elseif(mask(i-1,j)==1) then
-           ic = indx(I-1,j,k)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,2)
-           Coef(ic,6) = Coef(ic,6)+Coef(ic,7)
-           Coef(ic,13) = Coef(ic,13)+Coef(ic,12)
-           Coef(ic,2) = Zero
-           Coef(ic,7) = Zero
-           Coef(ic,12) = Zero
-         ! south
-         elseif(mask(i,j+1)==1) then
-           ic = indx(i,J+1,k)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,10)
-           Coef(ic,6) = Coef(ic,6)+Coef(ic,4)
-           Coef(ic,13) = Coef(ic,13)+Coef(ic,15)
-           Coef(ic,10) = Zero
-           Coef(ic,4) = Zero
-           Coef(ic,15) = Zero
-         ! north
-         elseif(mask(i,j-1)==1) then
-           ic = indx(i,J-1,k)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,3)
-           Coef(ic,6) = Coef(ic,6)+Coef(ic,8)
-           Coef(ic,13) = Coef(ic,13)+Coef(ic,11)
-           Coef(ic,3) = Zero
-           Coef(ic,8) = Zero
-           Coef(ic,11) = Zero
-         endif ! end mask+1=1 
-       endif ! end mask=0
-     enddo
-     enddo
-     enddo
-
-# if defined (OBSTACLE)
-     do i = Ibeg+1,Iend-1
-     do j = Jbeg+1,Jend-1
-     do k = Kbeg+1,Kend-1
-       if(set_flag(i,j,k)==1) then
-         ! left 
-         if(set_flag(i+1,j,k)==0) then
-           ic = indx(I+1,j,k)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,9)
-           Coef(ic,9) = Zero
-         ! right 
-         elseif(set_flag(i-1,j,k)==0) then
-           ic = indx(I-1,j,k)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,2)
-           Coef(ic,2) = Zero
-         ! south
-         elseif(set_flag(i,j+1,k)==0) then
-           ic = indx(i,J+1,k)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,10)
-           Coef(ic,10) = Zero
-         ! north
-         elseif(set_flag(i,j-1,k)==0) then
-           ic = indx(i,J-1,k)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,3)
-           Coef(ic,3) = Zero
-         ! bottom
-         elseif(set_flag(i,j,k+1)==0) then
-           ic = indx(i,j,k+1)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,13)
-           Coef(ic,13) = Zero
-         ! upper
-         elseif(set_flag(i,j,k-1)==0) then
-           ic = indx(i,j,k-1)
-           Coef(ic,1) = Coef(ic,1)+Coef(ic,6)
-           Coef(ic,6) = Zero
-         endif  
-       endif
-     enddo
-     enddo
-     enddo
-# endif
-
-     ! boundary conditions
-     ! left side
-# if defined (PARALLEL)
-     if(n_west.eq.MPI_PROC_NULL) then
-# endif
-     i = Ibeg
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-       ic = indx(i,j,k)
-       Coef(ic,1) = Coef(ic,1)+Coef(ic,9)
-       Coef(ic,6) = Coef(ic,6)+Coef(ic,5)
-       Coef(ic,13) = Coef(ic,13)+Coef(ic,14)
-       Coef(ic,9) = Zero
-       Coef(ic,5) = Zero
-       Coef(ic,14) = Zero
-     enddo
-     enddo
-# if defined (PARALLEL)
-     endif
-# endif
-
-     ! right side
-# if defined (PARALLEL)
-     if(n_east.eq.MPI_PROC_NULL) then
-# endif
-     i = Iend
-     do k = Kbeg,Kend
-     do j = Jbeg,Jend
-       ic = indx(i,j,k)
-       Coef(ic,1) = Coef(ic,1)+Coef(ic,2)
-       Coef(ic,6) = Coef(ic,6)+Coef(ic,7)
-       Coef(ic,13) = Coef(ic,13)+Coef(ic,12)
-       Coef(ic,2) = Zero
-       Coef(ic,7) = Zero
-       Coef(ic,12) = Zero
-     enddo
-     enddo
-# if defined (PARALLEL)
-     endif
-# endif
-
-     ! front side
-# if defined (PARALLEL)
-     if(n_suth.eq.MPI_PROC_NULL) then
-# endif
-     j = Jbeg
-     do k = Kbeg,Kend
-     do i = Ibeg,Iend
-       ic = indx(i,j,k)         
-       Coef(ic,1) = Coef(ic,1)+Coef(ic,10)
-       Coef(ic,6) = Coef(ic,6)+Coef(ic,4)
-       Coef(ic,13) = Coef(ic,13)+Coef(ic,15)
-       Coef(ic,10) = Zero
-       Coef(ic,4) = Zero
-       Coef(ic,15) = Zero
-     enddo
-     enddo
-# if defined (PARALLEL)
-     endif
-# endif
-
-     ! back side
-# if defined (PARALLEL)
-     if(n_nrth.eq.MPI_PROC_NULL) then
-# endif
-     j = Jend
-     do k = Kbeg,Kend
-     do i = Ibeg,Iend
-       ic = indx(i,j,k)
-       Coef(ic,1) = Coef(ic,1)+Coef(ic,3)
-       Coef(ic,6) = Coef(ic,6)+Coef(ic,8)
-       Coef(ic,13) = Coef(ic,13)+Coef(ic,11)
-       Coef(ic,3) = Zero
-       Coef(ic,8) = Zero
-       Coef(ic,11) = Zero
-     enddo
-     enddo
-# if defined (PARALLEL)
-     endif
-# endif
-
-     ! bottom side
-     k = Kbeg
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       ic = indx(i,j,k)
-# if defined (LANDSLIDE)
-       if(trim(SlideType)=='RIGID') then
-         Rhs(ic) = Rhs(ic)+Rho0*(dsig(Kbeg)+dsig(Kbeg-1))*(Coef(ic,13)*D(i,j)*Delt2H(i,j)+ &
-            Coef(ic,12)*D(i+1,j)*Delt2H(i+1,j)+Coef(ic,11)*D(i,j+1)*Delt2H(i,j+1)+ &
-            Coef(ic,14)*D(i-1,j)*Delt2H(i-1,j)+Coef(ic,15)*D(i,j-1)*Delt2H(i,j-1))
-       endif
-# endif
-
-!# if defined (TWOLAYERSLIDE)
-!       Rhs(ic) = Rhs(ic)+Rho0*(dsig(Kbeg)+dsig(Kbeg-1))*(Coef(ic,13)*D(i,j)*Delt2H(i,j)+ &             
-!          Coef(ic,12)*D(i+1,j)*Delt2H(i+1,j)+Coef(ic,11)*D(i,j+1)*Delt2H(i,j+1)+ &
-!          Coef(ic,14)*D(i-1,j)*Delt2H(i-1,j)+Coef(ic,15)*D(i,j-1)*Delt2H(i,j-1))
-!# endif
-
-       Coef(ic,6) = Coef(ic,6)+Coef(ic,13)
-       Coef(ic,7) = Coef(ic,7)+Coef(ic,12)
-       Coef(ic,8) = Coef(ic,8)+Coef(ic,11)
-       Coef(ic,5) = Coef(ic,5)+Coef(ic,14)
-       Coef(ic,4) = Coef(ic,4)+Coef(ic,15)
-       Coef(ic,13) = Zero
-       Coef(ic,12) = Zero
-       Coef(ic,11) = Zero
-       Coef(ic,14) = Zero
-       Coef(ic,15) = Zero
-     enddo
-     enddo
-
-     ! top side (Dirichlet boundary)
-     k = Kend
-     do j = Jbeg,Jend
-     do i = Ibeg,Iend
-       ic = indx(i,j,k)
-       Coef(ic,4) = Zero
-       Coef(ic,5) = Zero
-       Coef(ic,6) = Zero
-       Coef(ic,7) = Zero
-       Coef(ic,8) = Zero
-     enddo
-     enddo
-
-     ! take (i=2,j=2,k=2) to obtain the diagonal information
-     JCoef(1) = indx(Ibeg+1,Jbeg+1,Kbeg+1)-indx(Ibeg+1,Jbeg+1,Kbeg+1)  ! (i,j,k)
-     JCoef(2) = indx(Ibeg+2,Jbeg+1,Kbeg+1)-indx(Ibeg+1,Jbeg+1,Kbeg+1)  ! (i+1,j,k) 
-     JCoef(3) = indx(Ibeg+1,Jbeg+2,Kbeg+1)-indx(Ibeg+1,Jbeg+1,Kbeg+1)  ! (i,j+1,k)
-     JCoef(4) = indx(Ibeg+1,Jbeg,Kbeg+2)-indx(Ibeg+1,Jbeg+1,Kbeg+1)    ! (i,j-1,k+1)
-     JCoef(5) = indx(Ibeg,Jbeg+1,Kbeg+2)-indx(Ibeg+1,Jbeg+1,Kbeg+1)    ! (i-1,j,k+1)
-     JCoef(6) = indx(Ibeg+1,Jbeg+1,Kbeg+2)-indx(Ibeg+1,Jbeg+1,Kbeg+1)  ! (i,j,k+1)
-     JCoef(7) = indx(Ibeg+2,Jbeg+1,Kbeg+2)-indx(Ibeg+1,Jbeg+1,Kbeg+1)  ! (i+1,j,k+1)
-     JCoef(8) = indx(Ibeg+1,Jbeg+2,Kbeg+2)-indx(Ibeg+1,Jbeg+1,Kbeg+1)  ! (i,j+1,k+1)
-     JCoef(9) = indx(Ibeg,Jbeg+1,Kbeg+1)-indx(Ibeg+1,Jbeg+1,Kbeg+1)    ! (i-1,j,k)
-     JCoef(10) = indx(Ibeg+1,Jbeg,Kbeg+1)-indx(Ibeg+1,Jbeg+1,Kbeg+1)   ! (i,j-1,k)
-     JCoef(11) = indx(Ibeg+1,Jbeg+2,Kbeg)-indx(Ibeg+1,Jbeg+1,Kbeg+1)   ! (i,j+1,k-1)
-     JCoef(12) = indx(Ibeg+2,Jbeg+1,Kbeg)-indx(Ibeg+1,Jbeg+1,Kbeg+1)   ! (i+1,j,k-1)
-     JCoef(13) = indx(Ibeg+1,Jbeg+1,Kbeg)-indx(Ibeg+1,Jbeg+1,Kbeg+1)   ! (i,j,k-1)
-     JCoef(14) = indx(Ibeg,Jbeg+1,Kbeg)-indx(Ibeg+1,Jbeg+1,Kbeg+1)     ! (i-1,j,k-1)
-     JCoef(15) = indx(Ibeg+1,Jbeg,Kbeg)-indx(Ibeg+1,Jbeg+1,Kbeg+1)     ! (i,j-1,k-1)
-
-     deallocate(DelxS)
-     deallocate(DelyS)
-     deallocate(DelzS)
-     deallocate(A1) 
-     deallocate(indx)
-
-     return
-     end subroutine generate_coef_rhs
 
 
      subroutine eval_duvw(ISTEP)
@@ -1165,6 +662,7 @@
      if(trim(Veg_Type)=='FLEXIBLE') then
        ! update flexible vegetation height
        qz = 0.0
+! hack
        do j = Jbeg,Jend
        do i = Ibeg,Iend
          ! find depth-averaged load                                                            
@@ -1192,6 +690,7 @@
 
      ! solve total water depth D
      R1 = Zero
+! hack
      do j = Jbeg,Jend
      do i = Ibeg,Iend
        if(Mask(i,j)==0) cycle
@@ -1215,6 +714,7 @@
 
      ! prepare right-hand side terms
      R2 = Zero
+! hack
      do i = Ibeg,Iend
      do j = Jbeg,Jend
        if(Mask(i,j)==0) cycle  
@@ -1233,6 +733,7 @@
      enddo
 
      R3 = Zero
+! hack
      do i = Ibeg,Iend
      do j = Jbeg,Jend
        if(Mask(i,j)==0) cycle
@@ -1251,6 +752,7 @@
      enddo
 
      R4 = Zero
+! hack
      do i = Ibeg,Iend
      do j = Jbeg,Jend
        if(Mask(i,j)==0) cycle
@@ -1291,6 +793,7 @@
 # endif
 
      ! solve DU
+! hack
      do i = Ibeg,Iend
      do j = Jbeg,Jend
        if(Mask(i,j)==0) cycle
@@ -1403,6 +906,7 @@
      enddo
 
      ! solve DV
+! hack
      do i = Ibeg,Iend
      do j = Jbeg,Jend
        if(Mask(i,j)==0) cycle
@@ -1517,6 +1021,7 @@
      enddo
 
      ! solve DW
+! hack
      do i = Ibeg,Iend
      do j = Jbeg,Jend
        if(Mask(i,j)==0) cycle
@@ -1674,6 +1179,7 @@
      ! if running hydrostatic mode, replace vertical velocity
      ! in fact, W is useless. Only for output
      if(.not.NON_HYDRO) then
+! hack
        do i = Ibeg,Iend
        do j = Jbeg,Jend
        do k = Kbeg,Kend
@@ -1901,8 +1407,8 @@
 # if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
 # endif
-     do j = Jbeg,Jend
      do k = Kbeg,Kend
+     do j = Jbeg,Jend
        if(Bc_X0==1.or.Bc_X0==2) then
          Ex(Ibeg,j,k) = Zero
        elseif(Bc_X0==3) then
@@ -1917,8 +1423,8 @@
 # if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
 # endif
-     do j = Jbeg,Jend
      do k = Kbeg,Kend
+     do j = Jbeg,Jend
        if(Bc_Xn==1.or.Bc_Xn==2) then
          Ex(Iend1,j,k) = Zero
        elseif(Bc_Xn==3) then
@@ -1934,8 +1440,8 @@
 # if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
 # endif
-     do i = Ibeg,Iend
      do k = Kbeg,Kend
+     do i = Ibeg,Iend
        if(Bc_Y0==1.or.Bc_Y0==2) then
          Ey(i,Jbeg,k) = Zero
        endif
@@ -1948,8 +1454,8 @@
 # if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
 # endif
-     do i = Ibeg,Iend
      do k = Kbeg,Kend
+     do i = Ibeg,Iend
        if(Bc_Yn==1.or.Bc_Yn==2) then
          Ey(i,Jend1,k) = Zero
        endif
@@ -1961,6 +1467,7 @@
 
      ! update Omega
      Omega = zero
+!hack
      do i = Ibeg,Iend
      do j = Jbeg,Jend
      do k = Kbeg+1,Kend1
@@ -2003,9 +1510,9 @@
      implicit none
      integer :: i,j,k
 
+     do k = Kbeg,Kend
      do j = Jbeg,Jend
      do i = Ibeg,Iend
-     do k = Kbeg,Kend
        U(i,j,k) = DU(i,j,k)/D(i,j)
        V(i,j,k) = DV(i,j,k)/D(i,j)
        W(i,j,k) = DW(i,j,k)/D(i,j)
@@ -2142,8 +1649,8 @@
 
      OutL = Zero
      OutR = Zero
-     do i = Ibeg,Iend1
      do j = Jbeg,Jend
+     do i = Ibeg,Iend1
        OutL(i,j) = Vin(i-1,j)+0.5*dx*Din(i-1,j)
        OutR(i,j) = Vin(i,j)-0.5*dx*Din(i,j)
      enddo
@@ -2168,9 +1675,9 @@
 
      OutL = Zero
      OutR = Zero
-     do i = Ibeg,Iend1
-     do j = Jbeg,Jend
      do k = Kbeg,Kend
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend1
        OutL(i,j,k) = Vin(i-1,j,k)+0.5*dx*Din(i-1,j,k)
        OutR(i,j,k) = Vin(i,j,k)-0.5*dx*Din(i,j,k)
      enddo
@@ -2196,8 +1703,8 @@
 
      OutL = Zero
      OutR = Zero
-     do i = Ibeg,Iend
      do j = Jbeg,Jend1
+     do i = Ibeg,Iend
        OutL(i,j) = Vin(i,j-1)+0.5*dy*Din(i,j-1)
        OutR(i,j) = Vin(i,j)-0.5*dy*Din(i,j)
      enddo
@@ -2222,9 +1729,9 @@
 
      OutL = Zero
      OutR = Zero
-     do i = Ibeg,Iend
-     do j = Jbeg,Jend1
      do k = Kbeg,Kend
+     do j = Jbeg,Jend1
+     do i = Ibeg,Iend
        OutL(i,j,k) = Vin(i,j-1,k)+0.5*dy*Din(i,j-1,k)
        OutR(i,j,k) = Vin(i,j,k)-0.5*dy*Din(i,j,k)
      enddo
@@ -2250,9 +1757,9 @@
 
      OutL = Zero
      OutR = Zero
-     do i = Ibeg,Iend
-     do j = Jbeg,Jend
      do k = Kbeg,Kend1
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
        OutL(i,j,k) = Vin(i,j,k-1)+0.5*dsig(k-1)*Din(i,j,k-1)
        OutR(i,j,k) = Vin(i,j,k)-0.5*dsig(k)*Din(i,j,k)
      enddo
@@ -2262,246 +1769,6 @@
      end subroutine construct_3D_z
 
 
-     subroutine delxyzFun 
-!-------------------------------------------
-!    Calculate variable derivatives 
-!    Called by 
-!       fluxes 
-!    Last update: 04/01/2011, Gangfeng Ma
-!------------------------------------------
-     use global
-     implicit none
-     integer :: i
-     
-     call delxFun_2D(Eta,DelxEta)
-     call delxFun_3D(U,DelxU)
-     call delxFun_3D(V,DelxV)
-     call delxFun_3D(W,DelxW)
-     call delxFun_3D(DU,DelxDU)
-     call delxFun_3D(DV,DelxDV)
-     call delxFun_3D(DW,DelxDW)
-
-     call delyFun_2D(Eta,DelyEta)
-     call delyFun_3D(U,DelyU)
-     call delyFun_3D(V,DelyV)
-     call delyFun_3D(W,DelyW)
-     call delyFun_3D(DU,DelyDU)
-     call delyFun_3D(DV,DelyDV)
-     call delyFun_3D(DW,DelyDW)
-
-     call delzFun_3D(U,DelzU)
-     call delzFun_3D(V,DelzV)
-     call delzFun_3D(W,DelzW)
-
-     end subroutine delxyzFun
-
-     
-     subroutine delxFun_2D(Din,Dout)
-!-------------------------------------------
-!    Second-order derivative in x
-!    Called by
-!       delxyzFun
-!    Last update: 04/01/2011, Gangfeng Ma
-!------------------------------------------
-     use global, only: SP,Small,Zero,dx,Mloc,Nloc,Mask,Brks
-     implicit none
-     real(SP),intent(in),dimension(Mloc,Nloc)  :: Din
-     real(SP),intent(out),dimension(Mloc,Nloc) :: Dout
-     real(SP) :: TMP1,TMP2,LIMITER
-     integer :: i,j
-    
-     do i = 2,Mloc-1
-     do j = 1,Nloc
-       if(Mask(i,j)==0) then
-         Dout(i,j) = Zero
-       else
-         TMP1 = (Din(i+1,j)-Din(i,j))/dx
-         TMP2 = (Din(i,j)-Din(i-1,j))/dx
-
-         if((abs(TMP1)+abs(TMP2))<Small) then
-           Dout(i,j) = Zero
-         else
-           Dout(i,j) = LIMITER(TMP1,TMP2)
-         endif
-       endif
-     enddo
-     enddo
-
-     do j = 1,Nloc
-       Dout(1,j) = (Din(2,j)-Din(1,j))/dx
-       Dout(Mloc,j) = (Din(Mloc,j)-Din(Mloc-1,j))/dx
-     enddo  
-
-     return
-     end subroutine delxFun_2D
-
-
-     subroutine delxFun_3D(Din,Dout)
-!------------------------------------------
-!    Second-order derivative in x
-!    Called by 
-!       delxyzFun
-!    Last update: 04/01/2011, Gangfeng Ma
-!------------------------------------------
-     use global, only: SP,Small,Zero,dx,Mloc,Nloc,Kloc,Mask
-     implicit none
-     real(SP),intent(in),dimension(Mloc,Nloc,Kloc)  :: Din
-     real(SP),intent(out),dimension(Mloc,Nloc,Kloc) :: Dout
-     real(SP) :: TMP1,TMP2,LIMITER
-     integer :: i,j,k
-
-     do i = 2,Mloc-1
-     do j = 1,Nloc
-     do k = 1,Kloc
-       if(Mask(i,j)==0) then
-         Dout(i,j,k) = Zero
-       else
-         TMP1 = (Din(i+1,j,k)-Din(i,j,k))/dx
-         TMP2 = (Din(i,j,k)-Din(i-1,j,k))/dx
-
-         if((abs(TMP1)+abs(TMP2))<Small) then
-           Dout(i,j,k) = Zero
-         else
-           Dout(i,j,k) = LIMITER(TMP1,TMP2)
-         endif
-       endif
-     enddo
-     enddo
-     enddo
-
-     do j = 1,Nloc
-     do k = 1,Kloc
-       Dout(1,j,k) = (Din(2,j,k)-Din(1,j,k))/dx
-       Dout(Mloc,j,k) = (Din(Mloc,j,k)-Din(Mloc-1,j,k))/dx
-     enddo
-     enddo
-
-     return
-     end subroutine delxFun_3D
-
-
-     subroutine delyFun_2D(Din,Dout)
-!-----------------------------------------
-!    Second-order derivative in y
-!    Called by 
-!       delxyzFun  
-!    Last update: 04/01/2011, Gangfeng Ma  
-!------------------------------------------ 
-     use global, only: SP,Small,Zero,dy,Mloc,Nloc,Mask
-     implicit none
-     real(SP),intent(in),dimension(Mloc,Nloc)  :: Din
-     real(SP),intent(out),dimension(Mloc,Nloc) :: Dout
-     real(SP) :: TMP1,TMP2,LIMITER
-     integer :: i,j
-
-     do i = 1,Mloc
-     do j = 2,Nloc-1
-       if(Mask(i,j)==0) then 
-         Dout(i,j) = Zero
-       else
-         TMP1 = (Din(i,j+1)-Din(i,j))/dy
-         TMP2 = (Din(i,j)-Din(i,j-1))/dy
-
-         if((abs(TMP1)+abs(TMP2))<Small) then
-           Dout(i,j) = Zero
-         else
-           Dout(i,j) = LIMITER(TMP1,TMP2)
-         endif
-       endif
-     enddo
-     enddo
-
-     do i = 1,Mloc
-       Dout(i,1) = (Din(i,2)-Din(i,1))/dy
-       Dout(i,Nloc) = (Din(i,Nloc)-Din(i,Nloc-1))/dy
-     enddo
-
-     return
-     end subroutine delyFun_2D
-
-
-     subroutine delyFun_3D(Din,Dout)
-!-------------------------------------------
-!    Second-order derivative in y
-!    Called by
-!       delxyzFun 
-!    Last update: 04/01/2011, Gangfeng Ma 
-!-------------------------------------------
-     use global, only: SP,Small,Zero,dy,Mloc,Nloc,Kloc,Mask
-     implicit none
-     real(SP),intent(in),dimension(Mloc,Nloc,Kloc)  :: Din
-     real(SP),intent(out),dimension(Mloc,Nloc,Kloc) :: Dout
-     real(SP) :: TMP1,TMP2,LIMITER
-     integer :: i,j,k
-
-     do i = 1,Mloc
-     do j = 2,Nloc-1
-     do k = 1,Kloc
-       if(Mask(i,j)==0) then
-         Dout(i,j,k) = Zero
-       else
-         TMP1 = (Din(i,j+1,k)-Din(i,j,k))/dy
-         TMP2 = (Din(i,j,k)-Din(i,j-1,k))/dy
-
-         if((abs(TMP1)+abs(TMP2))<Small) then
-           Dout(i,j,k) = Zero
-         else
-           Dout(i,j,k) = LIMITER(TMP1,TMP2)
-         endif
-       endif
-     enddo
-     enddo
-     enddo
-
-     do i = 1,Mloc
-     do k = 1,Kloc
-       Dout(i,1,k) = (Din(i,2,k)-Din(i,1,k))/dy
-       Dout(i,Nloc,k) = (Din(i,Nloc,k)-Din(i,Nloc-1,k))/dy
-     enddo
-     enddo
-
-     return 
-     end subroutine delyFun_3D
-
-     
-     subroutine delzFun_3D(Din,Dout)
-!-------------------------------------------
-!    Second-order derivative in z
-!    Called by
-!       delxyzFun
-!    Last update: 04/01/2011, Gangfeng Ma
-!-------------------------------------------
-     use global, only: SP,Small,Zero,dsig,sigc,Mloc,Nloc,Kloc
-     implicit none
-     real(SP),intent(in),dimension(Mloc,Nloc,Kloc)  :: Din
-     real(SP),intent(out),dimension(Mloc,Nloc,Kloc) :: Dout
-     real(SP) :: TMP1,TMP2,LIMITER
-     integer :: i,j,k
-
-     do i = 1,Mloc
-     do j = 1,Nloc
-     do k = 2,Kloc-1
-       TMP1 = (Din(i,j,k+1)-Din(i,j,k))/(sigc(k+1)-sigc(k))
-       TMP2 = (Din(i,j,k)-Din(i,j,k-1))/(sigc(k)-sigc(k-1))
-
-       if((abs(TMP1)+abs(TMP2))<Small) then
-         Dout(i,j,k) = Zero
-       else
-         Dout(i,j,k) = LIMITER(TMP1,TMP2)
-       endif
-     enddo
-     enddo
-     enddo
-
-     do i = 1,Mloc
-     do j = 1,Nloc
-       Dout(i,j,1) = (Din(i,j,2)-Din(i,j,1))/(0.5*(dsig(1)+dsig(2)))
-       Dout(i,j,Kloc) = (Din(i,j,Kloc)-Din(i,j,Kloc-1))/(0.5*(dsig(Kloc-1)+dsig(Kloc)))
-     enddo
-     enddo
-
-     return
-     end subroutine delzFun_3D
 
 
      subroutine flux_bc
@@ -2519,6 +1786,7 @@
 # if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
 # endif
+!hack
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        if(Bc_X0==1.or.Bc_X0==2) then
@@ -3013,24 +2281,6 @@
      end subroutine wave_speed
 
 
-     FUNCTION LIMITER(A,B)
-     use global, only: SP,Zero,One,Small
-     IMPLICIT NONE
-     REAL(SP),INTENT(IN) :: A,B
-     REAL(SP) :: LIMITER
-
-!     ! minmod limiter
-!     LIMITER=max(Zero,min(A,B))
-
-!     ! van Leer limiter
-     LIMITER=(A*ABS(B)+ABS(A)*B)/(ABS(A)+ABS(B))
-
-!     ! superbee limiter
-!     LIMITER=SIGN(One,B)*MAX(Zero,MIN(2.0*ABS(B),SIGN(One,B)*A),  &
-!          MIN(ABS(B),2.0*SIGN(One,B)*A))
-
-     RETURN
-     END FUNCTION LIMITER
 
 
      subroutine source_terms
@@ -3665,7 +2915,12 @@
  
      end subroutine statistics
 
- 
+
+
+
+
+
+! hacker hot
      subroutine probes
 !--------------------------------------------------
 !    This subroutine is used to output probes
@@ -3679,13 +2934,13 @@
      character(len=80) :: STAT_FILE,FDIR,FILE_NUM
 
      FDIR = TRIM(RESULT_FOLDER)
-     
+
      do n = 1,NSTAT
        iu = 100+n
        write(FILE_NUM(1:4),'(I4.4)') n
        STAT_FILE = TRIM(FDIR)//'probe_'//TRIM(FILE_NUM)
        open(iu,file=TRIM(STAT_FILE),access='APPEND')
-       
+
        do j = Jbeg,Jend
        do i = Ibeg,Iend
          if(xstat(n)>=x(i).and.xstat(n)<=x(i+1).and.  &
@@ -3698,6 +2953,9 @@
      enddo
 
      end subroutine probes
+
+
+
 
 
      subroutine preview
@@ -12981,6 +12239,9 @@
     end subroutine flux_bc_ll
 
 
+
+
+
     subroutine delxyFun_ll
     use global
     implicit none
@@ -13000,6 +12261,9 @@
     call delyFun_2D(Kap,DelyKap)
 
     end subroutine delxyFun_ll
+
+
+
 
 
     subroutine calc_kap
@@ -13176,4 +12440,5 @@
     end subroutine HLL2D
 
 # endif
-!------------------------The End----------------------------------------------
+
+

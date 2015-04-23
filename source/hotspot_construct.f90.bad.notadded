@@ -1,0 +1,266 @@
+     subroutine construct_2D_x(Vin,Din,OutL,OutR)
+!-------------------------------------------------
+!    Construct 2D variables in x-direction
+!    Called by
+!       construction
+!    Last update: 04/01/2011, Gangfeng Ma
+!------------------------------------------------
+     use global, only: SP,Zero,dx,Mloc,Nloc,Mloc1, &
+                       Ibeg,Iend,Jbeg,Jend,Iend1
+     implicit none
+     real(SP),intent(in),dimension(Mloc,Nloc)   :: Vin,Din
+     real(SP),intent(out),dimension(Mloc1,Nloc) :: OutL,OutR
+     integer :: i,j
+
+     OutL = Zero
+     OutR = Zero
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend1
+       OutL(i,j) = Vin(i-1,j)+0.5*dx*Din(i-1,j)
+       OutR(i,j) = Vin(i,j)-0.5*dx*Din(i,j)
+     enddo
+     enddo
+
+     end subroutine construct_2D_x
+
+
+
+
+
+     subroutine construct_2D_y(Vin,Din,OutL,OutR)
+!-------------------------------------------------
+!    Construct 2D variables in y-direction
+!    Called by
+!       construction
+!    Last update: 04/01/2011, Gangfeng Ma
+!------------------------------------------------
+     use global, only: SP,Zero,dy,Mloc,Nloc,Nloc1, &
+                       Ibeg,Iend,Jbeg,Jend,Jend1
+     implicit none
+     real(SP),intent(in),dimension(Mloc,Nloc)   :: Vin,Din
+     real(SP),intent(out),dimension(Mloc,Nloc1) :: OutL,OutR
+     integer :: i,j
+
+     OutL = Zero
+     OutR = Zero
+     do j = Jbeg,Jend1
+     do i = Ibeg,Iend
+       OutL(i,j) = Vin(i,j-1)+0.5*dy*Din(i,j-1)
+       OutR(i,j) = Vin(i,j)-0.5*dy*Din(i,j)
+     enddo
+     enddo
+
+     end subroutine construct_2D_y
+
+
+
+
+
+     subroutine construct_3D_x(Vin,Din,OutL,OutR)
+!-------------------------------------------------
+!    Construct 3D variables in x-direction
+!    Called by
+!       construction
+!    Last update: 04/01/2011, Gangfeng Ma
+!------------------------------------------------
+     use global, only: SP,Zero,dx,Mloc,Nloc,Kloc,Mloc1, &
+                       Ibeg,Iend,Jbeg,Jend,Iend1,Kbeg,Kend
+     implicit none
+     real(SP),intent(in),dimension(Mloc,Nloc,Kloc)   :: Vin,Din
+     real(SP),intent(out),dimension(Mloc1,Nloc,Kloc) :: OutL,OutR
+     integer :: i,j,k
+
+     OutL = Zero
+     OutR = Zero
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend1
+       OutL(i,j,k) = Vin(i-1,j,k)+0.5*dx*Din(i-1,j,k)
+       OutR(i,j,k) = Vin(i,j,k)-0.5*dx*Din(i,j,k)
+     enddo
+     enddo
+     enddo
+
+     end subroutine construct_3D_x
+
+
+
+
+
+     subroutine construct_3D_y(Vin,Din,OutL,OutR)
+!-------------------------------------------------
+!    Construct 3D variables in y-direction
+!    Called by
+!       construction
+!    Last update: 04/01/2011, Gangfeng Ma
+!------------------------------------------------
+     use global, only: SP,Zero,dy,Mloc,Nloc,Kloc,Nloc1, &
+                       Ibeg,Iend,Jbeg,Jend,Jend1,Kbeg,Kend
+     implicit none
+     real(SP),intent(in),dimension(Mloc,Nloc,Kloc)   :: Vin,Din
+     real(SP),intent(out),dimension(Mloc,Nloc1,Kloc) :: OutL,OutR
+     integer :: i,j,k
+
+     OutL = Zero
+     OutR = Zero
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend1
+     do i = Ibeg,Iend
+       OutL(i,j,k) = Vin(i,j-1,k)+0.5*dy*Din(i,j-1,k)
+       OutR(i,j,k) = Vin(i,j,k)-0.5*dy*Din(i,j,k)
+     enddo
+     enddo
+     enddo
+
+     end subroutine construct_3D_y
+
+
+
+
+
+
+     subroutine construct_3D_z(Vin,Din,OutL,OutR)
+!-------------------------------------------------
+!    Construct 3D variables in z-direction
+!    Called by
+!       construction
+!    Last update: 04/01/2011, Gangfeng Ma
+!------------------------------------------------
+     use global, only: SP,Zero,dsig,Mloc,Nloc,Kloc,Kloc1, &
+                       Ibeg,Iend,Jbeg,Jend,Kbeg,Kend,Kend1
+     implicit none
+     real(SP),intent(in),dimension(Mloc,Nloc,Kloc)   :: Vin,Din
+     real(SP),intent(out),dimension(Mloc,Nloc,Kloc1) :: OutL,OutR
+     integer :: i,j,k
+
+     OutL = Zero
+     OutR = Zero
+     do k = Kbeg,Kend1
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       OutL(i,j,k) = Vin(i,j,k-1)+0.5*dsig(k-1)*Din(i,j,k-1)
+       OutR(i,j,k) = Vin(i,j,k)-0.5*dsig(k)*Din(i,j,k)
+     enddo
+     enddo
+     enddo
+
+     end subroutine construct_3D_z
+
+
+
+
+     subroutine construction
+!------------------------------------------
+!    Second-order construction
+!    Called by
+!       fluxes
+!    Last update: 04/01/2011, Gangfeng Ma
+!-----------------------------------------
+     use global
+     implicit none
+     integer :: i,j,k
+
+     call construct_2D_x(Eta,DelxEta,EtaxL,EtaxR)
+     call construct_3D_x(U,DelxU,UxL,UxR)
+     call construct_3D_x(V,DelxV,VxL,VxR)
+     call construct_3D_x(W,DelxW,WxL,WxR)
+     call construct_3D_x(DU,DelxDU,DUxL,DUxR)
+     call construct_3D_x(DV,DelxDV,DVxL,DVxR)
+     call construct_3D_x(DW,DelxDW,DWxL,DWxR)
+
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend1
+       DxL(i,j) = EtaxL(i,j)+hfx(i,j)
+       DxR(i,j) = EtaxR(i,j)+hfx(i,j)
+       ExL(i,j,k) = DUxL(i,j,k)
+       ExR(i,j,k) = DUxR(i,j,k)
+       FxL(i,j,k) = DUxL(i,j,k)*UxL(i,j,k)+0.5*Grav*(EtaxL(i,j)*EtaxL(i,j)+2.0*EtaxL(i,j)*hfx(i,j))
+       FxR(i,j,k) = DUxR(i,j,k)*UxR(i,j,k)+0.5*Grav*(EtaxR(i,j)*EtaxR(i,j)+2.0*EtaxR(i,j)*hfx(i,j))
+       GxL(i,j,k) = DxL(i,j)*UxL(i,j,k)*VxL(i,j,k)
+       GxR(i,j,k) = DxR(i,j)*UxR(i,j,k)*VxR(i,j,k)
+       HxL(i,j,k) = DxL(i,j)*UxL(i,j,k)*WxL(i,j,k)
+       HxR(i,j,k) = DxR(i,j)*UxR(i,j,k)*WxR(i,j,k)
+     enddo
+     enddo
+     enddo
+
+     call construct_2D_y(Eta,DelyEta,EtayL,EtayR)
+     call construct_3D_y(U,DelyU,UyL,UyR)
+     call construct_3D_y(V,DelyV,VyL,VyR)
+     call construct_3D_y(W,DelyW,WyL,WyR)
+     call construct_3D_y(DU,DelyDU,DUyL,DUyR)
+     call construct_3D_y(DV,DelyDV,DVyL,DVyR)
+     call construct_3D_y(DW,DelyDW,DWyL,DWyR)
+
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend1
+     do i = Ibeg,Iend
+       DyL(i,j) = EtayL(i,j)+hfy(i,j)
+       DyR(i,j) = EtayR(i,j)+hfy(i,j)
+       EyL(i,j,k) = DVyL(i,j,k)
+       EyR(i,j,k) = DVyR(i,j,k)
+       FyL(i,j,k) = DyL(i,j)*UyL(i,j,k)*VyL(i,j,k)
+       FyR(i,j,k) = DyR(i,j)*UyR(i,j,k)*VyR(i,j,k)
+       GyL(i,j,k) = DVyL(i,j,k)*VyL(i,j,k)+0.5*Grav*(EtayL(i,j)*EtayL(i,j)+2.0*EtayL(i,j)*hfy(i,j))
+       GyR(i,j,k) = DVyR(i,j,k)*VyR(i,j,k)+0.5*Grav*(EtayR(i,j)*EtayR(i,j)+2.0*EtayR(i,j)*hfy(i,j))
+       HyL(i,j,k) = DyL(i,j)*VyL(i,j,k)*WyL(i,j,k)
+       HyR(i,j,k) = DyR(i,j)*VyR(i,j,k)*WyR(i,j,k)
+     enddo
+     enddo
+     enddo
+
+     call construct_3D_z(U,DelzU,UzL,UzR)
+     call construct_3D_z(V,DelzV,VzL,VzR)
+     call construct_3D_z(W,DelzW,WzL,WzR)
+
+     end subroutine construction
+    subroutine construction_ll
+    use global
+    implicit none
+    integer :: i,j
+    real(SP) :: CosAlpha
+
+    call construct_2D_x(Ha,DelxHa,HaxL,HaxR)
+    call construct_2D_x(Ua,DelxUa,UaxL,UaxR)
+    call construct_2D_x(Va,DelxVa,VaxL,VaxR)
+    call construct_2D_x(HUa,DelxHUa,HUaxL,HUaxR)
+    call construct_2D_x(HVa,DelxHVa,HVaxL,HVaxR)
+    call construct_2D_x(Kap,DelxKap,KapxL,KapxR)
+
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend1
+      CosAlpha  = 0.5*(CosAng(i,j)+cosAng(i-1,j))
+      EaxL(i,j) = HUaxL(i,j)
+      EaxR(i,j) = HUaxR(i,j)
+      FaxL(i,j) = HUaxL(i,j)*UaxL(i,j)+0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapxL(i,j)+ &
+                  SlideLambda)*HaxL(i,j)*HaxL(i,j)
+      FaxR(i,j) = HUaxR(i,j)*UaxR(i,j)+0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapxR(i,j)+ &
+                  SlideLambda)*HaxR(i,j)*HaxR(i,j)
+      GaxL(i,j) = HaxL(i,j)*UaxL(i,j)*VaxL(i,j)
+      GaxR(i,j) = HaxR(i,j)*UaxR(i,j)*VaxR(i,j)
+    enddo
+    enddo
+
+    call construct_2D_y(Ha,DelyHa,HayL,HayR)
+    call construct_2D_y(Ua,DelyUa,UayL,UayR)
+    call construct_2D_y(Va,DelyVa,VayL,VayR)
+    call construct_2D_y(HUa,DelyHUa,HUayL,HUayR)
+    call construct_2D_y(HVa,DelyHVa,HVayL,HVayR)
+    call construct_2D_y(Kap,DelyKap,KapyL,KapyR)
+
+    do j = Jbeg,Jend1
+    do i = Ibeg,Iend
+      CosAlpha  = 0.5*(CosAng(i,j)+CosAng(i,j-1))
+      EayL(i,j) = HVayL(i,j)
+      EayR(i,j) = HVayR(i,j)
+      FayL(i,j) = HayL(i,j)*UayL(i,j)*VayL(i,j)
+      FayR(i,j) = HayR(i,j)*UayR(i,j)*VayR(i,j)
+      GayL(i,j) = HVayL(i,j)*VayL(i,j)+0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapyL(i,j)+ &
+                  SlideLambda)*HayL(i,j)*HayL(i,j)
+      GayR(i,j) = HVayR(i,j)*VayR(i,j)+0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapyR(i,j)+ &
+                  SlideLambda)*HayR(i,j)*HayR(i,j)
+    enddo
+    enddo
+
+    end subroutine construction_ll

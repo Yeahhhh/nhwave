@@ -1,0 +1,178 @@
+
+DEFAULT_SHELL := $(shell which sh)
+DEFAULT_CPP := $(shell which cpp)
+DEFAULT_FC := $(shell which gfortran)
+
+DEFAULT_CPPFLAGS += -P
+DEFAULT_CPPFLAGS += -C
+DEFAULT_CPPFLAGS += -traditional
+
+DEFAULT_BIN_NAME := nhwave
+DEFAULT_BIN_PREFIX :=
+DEFAULT_BIN_SUFFIX :=
+
+DEFAULT_FFLAGS := -O0 -g
+DEFAULT_FFLAGS_HOT := -fast
+DEFAULT_LDFLAGS := -fast
+
+CREATE_CONFIG ?=
+
+ifeq ($(strip $(CREATE_CONFIG)),)
+
+CONFIG ?= default
+
+BUILD_DIR := ../build/$(CONFIG)
+
+include config/$(CONFIG).mk
+
+
+
+
+
+
+
+SRC_MODS += mod_global.F mod_util.F mod_timing.f90
+SRC_HOTSPOT_F += hotspot_generate_coef_rhs.F
+SRC_HOTSPOT_F += hotspot_hypre_pres_solver.F
+SRC_HOTSPOT_F += hotspot_delxyzFun.F
+SRCS += $(MODS) $(HOTSPOT_F) nhware.F
+
+
+SRC_TMP := $(shell                                        \
+                 echo $(SRCS:.F=.f90) $(wildcard *.f90) | \
+                 sed 's/ /\n/g'                         | \
+                 sed 's$$\(.*\)$$$(BUILD_DIR)/\1$$g'    | \
+                 sort -u                                  \
+            )
+
+OBJ_MODS := $(shell                                   \
+                 echo $(SRC_MODS:.F=.o)              |\
+                 sed 's/ /\n/g'                      |\
+                 sed 's$$\(.*\)$$$(BUILD_DIR)/\1$$g' |\
+                 sort -u                              \
+             )
+
+OBJS := $(SRC_TMP:.f90=.o)
+
+BIN := $(BUILD_DIR)/$(BIN_PREFIX)$(BIN_NAME)$(BIN_SUFFIX)
+
+.INTERMEDIATE: $(SRC_TMP)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+all: $(BIN)
+
+$(BIN): $(OBJS)
+#	$(FC) $(LDFLAGS) $(HYPRE_LDFLAGS) $^ -o $@ $(HYPRE_LIBS) $(LIBS)
+	$(FC) -acc $(LDFLAGS) $(HYPRE_LDFLAGS) $^ -o $@ $(HYPRE_LIBS) $(LIBS)
+	$(shell ln -s -f $@ $(BIN_NAME))
+
+
+$(BUILD_DIR)/%.f90: %.F $(BUILD_DIR)
+	$(CPP) $(CPPFLAGS) $(OPTIONS) $< -o $@
+
+$(BUILD_DIR)/%.f90: %.f90 $(BUILD_DIR)
+	cp $< $@
+
+$(BUILD_DIR)/%.o: $(BUILD_DIR)/%.f90 $(BUILD_DIR)
+	$(FC) -c $(FFLAGS) $< -o $@
+
+$(BUILD_DIR)/generate_coef_rhs.o: $(BUILD_DIR)/generate_coef_rhs.f90 $(BUILD_DIR)
+	$(FC) -c -acc -Minfo=accel -fast $(HYPRE_FFLAGS) $< -o $@
+aaa:
+	echo hello
+
+$(BUILD_DIR)/hotspot_hypre_pres_solver.o: $(BUILD_DIR)/hotspot_hypre_pres_solver.f90 $(BUILD_DIR)
+	$(FC) -c $(FFLAGS) $(HYPRE_FFLAGS) $< -o $@
+
+$(BUILD_DIR)/hotspot_xyzFun_3D.o: $(BUILD_DIR)/hotspot_xyzFun_3D.f90 $(BUILD_DIR)
+#	$(FC) -c $(FFLAGS_HOT) $(HYPRE_FFLAGS) $< -o $@
+#	$(FC) -c $(FFLAGS_HOT) $(HYPRE_FFLAGS) $< -o $@
+	$(FC) -c -acc -fast  $(HYPRE_FFLAGS) $< -o $@
+
+
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+clean-all:
+	rm -rf ../build/*/
+
+test:
+	@mkdir -p logs
+	@(                           \
+		set -e                  ;\
+		source env/$(CONFIG).sh ;\
+		make CONFIG=$(CONFIG)   ;\
+		source run/$(CONFIG).sh  \
+	) 2>&1 | tee logs/$(CONFIG).log
+
+help:
+	@(
+	make CREATE_CONFIG=xxxxx
+	make CONFIG=xxx OVERRIDEVAR=xxx
+	)
+
+
+
+else # CREATE_CONFIG
+all:
+	@mkdir -p config
+	@(                                               \
+		echo                                        ;\
+		echo 'SHELL ?= $$(DEFAULT_SHELL)'           ;\
+		echo                                        ;\
+		echo 'CPP ?= $$(DEFAULT_CPP)'               ;\
+		echo 'CPPFLAGS ?= $$(DEFAULT_CPPFLAGS)'     ;\
+		echo                                        ;\
+		echo 'FC ?= $$(DEFAULT_FC)'                 ;\
+		echo 'FFLAGS ?= $$(DEFAULT_FFLAGS)'         ;\
+		echo 'FFLAGS_HOT ?= $$(DEFAULT_FFLAGS_HOT)' ;\
+		echo                                        ;\
+		echo 'LDFLAGS ?= $$(DEFAULT_LDFLAGS)'       ;\
+		echo                                        ;\
+		echo 'BIN_NAME ?= $$(DEFAULT_BIN_NAME)'     ;\
+		echo 'BIN_PREFIX ?= $$(DEFAULT_BIN_PREFIX)' ;\
+		echo 'BIN_SUFFIX ?= $$(DEFAULT_BIN_SUFFIX)' ;\
+		echo                                        ;\
+		echo 'OPTIONS += -DDOUBLE_PRECISION'        ;\
+		echo 'OPTIONS += -DPARALLEL'                ;\
+		echo 'OPTIONS += -DLANDSLIDE'               ;\
+		echo 'OPTIONS += -DSALINITY'                ;\
+		echo 'OPTIONS += -DTEMPERATURE'             ;\
+		echo 'OPTIONS += -DBUBBLE'                  ;\
+		echo 'OPTIONS += -DSEDIMENT'                ;\
+		echo 'OPTIONS += -DVEGETATION'              ;\
+		echo 'OPTIONS += -DINTEL'                   ;\
+		echo 'OPTIONS += -DBALANCE2D'               ;\
+		echo 'OPTIONS += -DTWOLAYERSLIDE'           ;\
+		echo 'OPTIONS += -DCORALREEF'               ;\
+		echo                                        ;\
+		echo 'HYPRE_FFLAGS ?= '                     ;\
+		echo 'HYPRE_LDFLAGS ?= '                    ;\
+		echo 'HYPRE_LIBS ?= '                       ;\
+		echo                                        ;\
+	) > config/$(CREATE_CONFIG).mk
+endif
+
+.SUFFIXES: .o .f90 .F
+.PHONY: all clean clean-config test
+
+
+
+

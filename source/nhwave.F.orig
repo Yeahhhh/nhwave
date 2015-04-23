@@ -13,11 +13,11 @@
      integer :: j,Istage
      real(SP) :: tbegin,tend
 
-
+# if defined (PARALLEL)
      call MPI_INIT(ier)
      call MPI_COMM_RANK(MPI_COMM_WORLD,myid,ier)
      call MPI_COMM_SIZE(MPI_COMM_WORLD,NumP,ier)
-
+# endif
 
      ! record wall time
      call wall_time_secs(tbegin)
@@ -46,12 +46,12 @@
        ! time step     
        call estimate_dt
 
-
-
-
-
-
-
+# if defined (LANDSLIDE)
+       ! run landslide-generated tsunami
+       if(trim(SlideType)=='RIGID') then
+         call update_bathymetry
+       endif
+# endif
 
        ! update boundary conditions       
        call update_wave_bc
@@ -59,10 +59,10 @@
        ! update mask
        call update_mask
 
-
-
-
-
+# if defined (TWOLAYERSLIDE)
+       ! update mask for lower layer
+       call update_maska
+# endif
 
        ! update wind
        call update_wind
@@ -82,6 +82,19 @@
          ! update all variables
          call eval_duvw(Istage)
 
+# if defined (TWOLAYERSLIDE)
+         ! fluxes for lower layer
+         call fluxes_ll
+
+         ! source terms for lower layer
+         call source_terms_ll
+
+         ! update variables for lower layer
+         call eval_huv_ll(Istage) 
+
+         ! update the thickness of upper layer
+         call update_hc_ul
+# endif
 
          ! sponge layer
          if(SPONGE_ON) then
@@ -91,12 +104,52 @@
          ! turbulence model
          if(VISCOUS_FLOW) call eval_turb(Istage)
 
+# if defined (SALINITY)
+         ! update salinity
+         call eval_sali(Istage)
+
+         ! update density
+         call eval_dens  
+# endif
+
+# if defined (BUBBLE)
+         if(TIME>=TIM_B) then
+           ! bubble rise velocity
+           call bslip_velocity
+
+           ! update bubble concentration
+           call eval_bub(Istage)
+         endif
+# endif
 
 
+# if defined (SEDIMENT)
+         if(TIME>=TIM_Sedi) then
 
+           ! sediment settling velocity
+           call settling_velocity
+
+           ! update sediment concentration
+           call eval_sedi(Istage)
+   
+           ! update mixture density
+           if(COUPLE_FS) call eval_dens
+
+           ! bed-load sediment transport
+           if(BED_LOAD) call eval_bedload
+
+           ! update bed elevation
+           if(BED_CHANGE) call update_bed(Istage)          
+
+         endif
+# endif
 
        enddo
 
+# if defined (BALANCE2D)
+       ! evaluate momentum balance in cross-shore
+       call eval_balance
+# endif
 
        ! wave average quantities
        if(WAVE_AVERAGE_ON) then
@@ -135,19 +188,177 @@
        call print_wh_setup
      endif
 
+# if defined (PARALLEL)
      if(myid.eq.0) write(*,*) 'Normal Termination!'
      if(myid.eq.0) write(3,*) 'Normal Termination!'
+# else
+     write(*,*) 'Normal Termination!'
+     write(3,*) 'Normal Termination!'
+# endif
 
      ! wall time at the end
      call wall_time_secs(tend)
 
+# if defined (PARALLEL)
      if(myid.eq.0) write(*,*) 'Simulation takes',tend-tbegin,'seconds'
      if(myid.eq.0) write(3,*) 'Simulation takes',tend-tbegin,'seconds'
+# else
+     write(*,*) 'Simulation takes',tend-tbegin,'seconds'
+     write(3,*) 'Simulation takes',tend-tbegin,'seconds'
+# endif
 
+# if defined (PARALLEL)
      call MPI_FINALIZE(ier)
+# endif
 
      end
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# if defined (BALANCE2D)
+     subroutine eval_balance
+!-------------------------------------------                                                  
+!    Evaluate momentum balance in y-dir
+!    Called by                         
+!       main
+!    Last update: 25/12/2012, Gangfeng Ma
+!-------------------------------------------
+     use global
+     implicit none
+     integer :: i,j,k
+     real(SP), dimension(:,:,:),allocatable :: DelxP,DelyP,DelzP
+     real(SP) :: Dz1,Cdrag,Umag
+
+     allocate(DelxP(Mloc,Nloc,Kloc))
+     allocate(DelyP(Mloc,Nloc,Kloc))
+     allocate(DelzP(Mloc,Nloc,Kloc))
+
+     DelxP = Zero
+     DelyP = Zero
+     DelzP = Zero
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       DelxP(i,j,k) = 0.5*((P(i+1,j,k)-P(i-1,j,k))/(2.*dx)+(P(i+1,j,k+1)-P(i-1,j,k+1))/(2.*dx))
+       DelyP(i,j,k) = 0.5*((P(i,j+1,k)-P(i,j-1,k))/(2.*dy)+(P(i,j+1,k+1)-P(i,j-1,k+1))/(2.*dy))   
+       DelzP(i,j,k) = (P(i,j,k+1)-P(i,j,k))/dsig(k)
+     enddo
+     enddo
+     enddo
+
+     ! hydrostatic pressure gradient
+     DEDX2D = zero
+     DEDY2D = zero
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       if(Mask(i,j)==1) then
+         DEDX2D(i,j) = -grav*D(i,j)*(Eta(i+1,j)-Eta(i-1,j))/(2.*dx)
+         DEDY2D(i,j) = -grav*D(i,j)*(Eta(i,j+1)-Eta(i,j-1))/(2.*dy)
+       endif
+     enddo
+     enddo
+
+     ! dynamic pressure contribution
+     DPDX2D = zero
+     DPDY2D = zero
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       if(Mask(i,j)==1) then
+         do k = Kbeg,Kend
+           DPDX2D(i,j) = DPDX2D(i,j)-D(i,j)/Rho0*  &
+                (DelxP(i,j,k)+DelzP(i,j,k)*DelxSc(i,j,k))*dsig(k)
+           DPDY2D(i,j) = DPDY2D(i,j)-D(i,j)/Rho0*  &
+                (DelyP(i,j,k)+DelzP(i,j,k)*DelySc(i,j,k))*dsig(k)
+         enddo
+       endif
+     enddo
+     enddo
+
+     ! turbulent horizontal diffusion
+     DIFFX2D = zero
+     DIFFY2D = zero
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       if(Mask(i,j)==1) then
+         do k = Kbeg,Kend
+           DIFFX2D(i,j) = DIFFX2D(i,j)+(Diffxx(i,j,k)+Diffxy(i,j,k))*dsig(k)
+           DIFFY2D(i,j) = DIFFY2D(i,j)+(Diffyx(i,j,k)+Diffyy(i,j,k))*dsig(k)
+         enddo
+       endif
+     enddo
+     enddo
+
+# if defined (VEGETATION)
+     FVEGX2D = zero
+     FVEGY2D = zero
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=1.6.and.Yc(j)<=4.8)) then
+         if(sigc(k)*D(i,j)<=VegH) then
+           Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+           FVEGX2D(i,j) = FVEGX2D(i,j)-0.5*Vegbv*VegDens*VegDrag*Umag*DU(i,j,k)*dsig(k)
+           FVEGY2D(i,j) = FVEGY2D(i,j)-0.5*Vegbv*VegDens*VegDrag*Umag*DV(i,j,k)*dsig(k)
+         endif
+       endif
+     enddo
+     enddo
+# endif
+
+     ! bottom friction contribution
+     TAUBX2D = zero
+     TAUBY2D = zero
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       if(Mask(i,j)==1) then
+         Dz1 = 0.5*D(i,j)*dsig(Kbeg)
+         if(ibot==1) then
+           if(hc(i,j)>0.1) then
+             Cdrag = Cd0
+           else
+             Cdrag = 0.2
+           endif
+         else
+           Cdrag = 1./(1./Kappa*log(30.0*Dz1/Zob))**2
+         endif
+         TAUBX2D(i,j) = -Cdrag*sqrt(U(i,j,Kbeg)**2+V(i,j,Kbeg)**2)*U(i,j,Kbeg)
+         TAUBY2D(i,j) = -Cdrag*sqrt(U(i,j,Kbeg)**2+V(i,j,Kbeg)**2)*V(i,j,Kbeg)
+       endif
+     enddo
+     enddo
+
+     ! acceleration
+     DUDT2D = zero
+     DVDT2D = zero
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       if(Mask(i,j)==1) then
+         do k = Kbeg,Kend 
+           DVDT2D(i,j) = DVDT2D(i,j)+(DV(i,j,k)-DV0(i,j,k))/dt*dsig(k)
+         enddo
+       endif      
+     enddo
+     enddo
+
+     deallocate(DelxP)
+     deallocate(DelyP)
+     deallocate(DelzP)
+
+     end subroutine eval_balance
+# endif
 
      subroutine projection_corrector
 !-------------------------------------------
@@ -185,9 +396,25 @@
      do i = Ibeg,Iend
        if(Mask(i,j)==0) cycle
 
+# if defined (OBSTACLE)
+       if(set_flag(i,j,k)==1) then
+         DU(i,j,k) = D(i,j)*obs_u
+         DV(i,j,k) = D(i,j)*obs_v
+         DW(i,j,k) = D(i,j)*obs_w
+       else
+         DU(i,j,k) = DU(i,j,k)-D(i,j)*dt/Rho0*(DelxP(i,j,k)+DelzP(i,j,k)*DelxSc(i,j,k))
+         DV(i,j,k) = DV(i,j,k)-D(i,j)*dt/Rho0*(DelyP(i,j,k)+DelzP(i,j,k)*DelySc(i,j,k))                
+         DW(i,j,k) = DW(i,j,k)-dt/Rho0*DelzP(i,j,k)
+       endif
+
+       PresForceX(i,j,k) = -D(i,j)/Rho0*(DelxP(i,j,k)+DelzP(i,j,k)*DelxSc(i,j,k))
+       PresForceY(i,j,k) = -D(i,j)/Rho0*(DelyP(i,j,k)+DelzP(i,j,k)*DelySc(i,j,k))
+       PresForceZ(i,j,k) = -1.0/Rho0*DelzP(i,j,k)
+# else       
        DU(i,j,k) = DU(i,j,k)-D(i,j)*dt/Rho0*(DelxP(i,j,k)+DelzP(i,j,k)*DelxSc(i,j,k))
        DV(i,j,k) = DV(i,j,k)-D(i,j)*dt/Rho0*(DelyP(i,j,k)+DelzP(i,j,k)*DelySc(i,j,k))
        DW(i,j,k) = DW(i,j,k)-dt/Rho0*DelzP(i,j,k)
+# endif
      enddo
      enddo
      enddo
@@ -210,12 +437,78 @@
      use global
      implicit none
      integer :: i,j,k,imask
+# if !defined (PARALLEL)
+     ! variables for serial computation
+     real(SP), dimension(:), allocatable :: Wksp
+     integer,  dimension(:), allocatable :: IWksp
+     real(SP), dimension(neqns) :: Phi
+     real(SP) :: RPARM(30),Pbar(1)
+     integer :: IPARM(30),S(1),IS(1),nwksp,inwksp,Ndim,Mdim,N,Maxnz,ierr,neq
+     external :: MIC3,IC3,SOR3,GMRES,CG,BCGS
+# endif
 
      ! generate coefficient matrix and rhs
      call generate_coef_rhs
 
+# if defined (PARALLEL)
      ! use HYPRE package for parallel computation
      call hypre_pres_solver
+# else
+     ! use NSPCG package for serial computation
+     call dfault(IPARM,RPARM)
+
+     ! reset default values
+     IPARM(2) = itmax
+     IPARM(3) = 3
+     IPARM(4) = 33
+     RPARM(1) = tol
+
+     Ndim = 5*neqns
+     Mdim = 5*15
+     N = neqns
+     Maxnz = 15
+     nwksp = 30*neqns
+     inwksp = 10*neqns
+
+     allocate(Wksp(nwksp))
+     allocate(Iwksp(inwksp))
+   
+     ! initial guess
+     neq = 0
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       neq = neq+1
+       Phi(neq) = P(i,j,k)
+     enddo
+     enddo
+     enddo
+     
+     ! solve poisson equation using preconditioned CG or GMRES
+     if(isolver==1) then
+       call nspcg(MIC3,CG,Ndim,Mdim,N,Maxnz,Coef,JCoef,S,IS,  &
+           Phi,Pbar,Rhs,Wksp,IWksp,nwksp,inwksp,IPARM,RPARM,ierr)
+     elseif(isolver==2) then
+       call nspcg(IC3,GMRES,Ndim,Mdim,N,Maxnz,Coef,JCoef,S,IS,  &
+           Phi,Pbar,Rhs,Wksp,IWksp,nwksp,inwksp,IPARM,RPARM,ierr)  
+     elseif(isolver==3) then
+       call nspcg(SOR3,GMRES,Ndim,Mdim,N,Maxnz,Coef,JCoef,S,IS,  &
+           Phi,Pbar,Rhs,Wksp,IWksp,nwksp,inwksp,IPARM,RPARM,ierr)
+     endif   
+
+     neq = 0
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       neq = neq+1
+       P(i,j,k) = Phi(neq)
+     enddo
+     enddo
+     enddo
+
+     deallocate(Wksp)
+     deallocate(Iwksp)
+# endif
   
      ! fyshi gave boundary condition for dry cells
      ! set zero for dry set is inaccurate
@@ -253,7 +546,9 @@
      enddo
 
      ! collect into ghost cells
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do k = Kbeg,Kend
      do j = Jbeg,Jend
        do i = 1,Nghost
@@ -261,9 +556,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do k = Kbeg,Kend
      do j = Jbeg,Jend 
        do i = 1,Nghost     
@@ -271,9 +570,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      do k = Kbeg,Kend
      do i = Ibeg,Iend
        do j = 1,Nghost
@@ -281,9 +584,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      do k = Kbeg,Kend
      do i = Ibeg,Iend
        do j = 1,Nghost
@@ -291,13 +598,18 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      call phi_3D_exch(P)
+# endif
 
      end subroutine poisson_solver
 
 
+! hackathon profiling self 28.33%
      subroutine hypre_pres_solver
 !---------------------------------------------
 !    solve pressure using hypre package
@@ -305,6 +617,7 @@
 !       poisson_solver
 !    Last update: 22/08/2011, Gangfeng Ma
 !---------------------------------------------
+# if defined (PARALLEL)
      use global
      implicit none
      integer, parameter :: ndim=3
@@ -497,10 +810,13 @@
      deallocate(values)
      deallocate(Phi)
 
+# endif
      return
      end subroutine hypre_pres_solver
 
 
+
+! hackathon profiling self 7.32%
      subroutine generate_coef_rhs
 !---------------------------------------------
 !    Generate coefficient matrix and rhs
@@ -631,10 +947,53 @@
      enddo
      enddo
 
+# if defined (OBSTACLE)
+     do i = Ibeg+1,Iend-1
+     do j = Jbeg+1,Jend-1
+     do k = Kbeg+1,Kend-1
+       if(set_flag(i,j,k)==1) then
+         ! left 
+         if(set_flag(i+1,j,k)==0) then
+           ic = indx(I+1,j,k)
+           Coef(ic,1) = Coef(ic,1)+Coef(ic,9)
+           Coef(ic,9) = Zero
+         ! right 
+         elseif(set_flag(i-1,j,k)==0) then
+           ic = indx(I-1,j,k)
+           Coef(ic,1) = Coef(ic,1)+Coef(ic,2)
+           Coef(ic,2) = Zero
+         ! south
+         elseif(set_flag(i,j+1,k)==0) then
+           ic = indx(i,J+1,k)
+           Coef(ic,1) = Coef(ic,1)+Coef(ic,10)
+           Coef(ic,10) = Zero
+         ! north
+         elseif(set_flag(i,j-1,k)==0) then
+           ic = indx(i,J-1,k)
+           Coef(ic,1) = Coef(ic,1)+Coef(ic,3)
+           Coef(ic,3) = Zero
+         ! bottom
+         elseif(set_flag(i,j,k+1)==0) then
+           ic = indx(i,j,k+1)
+           Coef(ic,1) = Coef(ic,1)+Coef(ic,13)
+           Coef(ic,13) = Zero
+         ! upper
+         elseif(set_flag(i,j,k-1)==0) then
+           ic = indx(i,j,k-1)
+           Coef(ic,1) = Coef(ic,1)+Coef(ic,6)
+           Coef(ic,6) = Zero
+         endif  
+       endif
+     enddo
+     enddo
+     enddo
+# endif
 
      ! boundary conditions
      ! left side
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      i = Ibeg
      do k = Kbeg,Kend
      do j = Jbeg,Jend
@@ -647,10 +1006,14 @@
        Coef(ic,14) = Zero
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! right side
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      i = Iend
      do k = Kbeg,Kend
      do j = Jbeg,Jend
@@ -663,10 +1026,14 @@
        Coef(ic,12) = Zero
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! front side
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      j = Jbeg
      do k = Kbeg,Kend
      do i = Ibeg,Iend
@@ -679,10 +1046,14 @@
        Coef(ic,15) = Zero
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! back side
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      j = Jend
      do k = Kbeg,Kend
      do i = Ibeg,Iend
@@ -695,13 +1066,22 @@
        Coef(ic,11) = Zero
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! bottom side
      k = Kbeg
      do j = Jbeg,Jend
      do i = Ibeg,Iend
        ic = indx(i,j,k)
+# if defined (LANDSLIDE)
+       if(trim(SlideType)=='RIGID') then
+         Rhs(ic) = Rhs(ic)+Rho0*(dsig(Kbeg)+dsig(Kbeg-1))*(Coef(ic,13)*D(i,j)*Delt2H(i,j)+ &
+            Coef(ic,12)*D(i+1,j)*Delt2H(i+1,j)+Coef(ic,11)*D(i,j+1)*Delt2H(i,j+1)+ &
+            Coef(ic,14)*D(i-1,j)*Delt2H(i-1,j)+Coef(ic,15)*D(i,j-1)*Delt2H(i,j-1))
+       endif
+# endif
 
 !# if defined (TWOLAYERSLIDE)
 !       Rhs(ic) = Rhs(ic)+Rho0*(dsig(Kbeg)+dsig(Kbeg-1))*(Coef(ic,13)*D(i,j)*Delt2H(i,j)+ &             
@@ -800,6 +1180,34 @@
      ! external forcing
      if(EXTERNAL_FORCING) call driver(ExtForceX,ExtForceY)
 
+# if defined (VEGETATION)
+     if(trim(Veg_Type)=='FLEXIBLE') then
+       ! update flexible vegetation height
+       qz = 0.0
+       do j = Jbeg,Jend
+       do i = Ibeg,Iend
+         ! find depth-averaged load                                                            
+         do k = Kbeg,Kend
+           if(sigc(k)*D(i,j)<=(2./3.*FVegH(i,j)+1./3.*VegH)) then
+             Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+             qz(i,j) = qz(i,j)+0.5*Rho0*VegDrag*foliage(i,j)*VegH/FVegH(i,j)*  &
+                 Umag**2*Vegbv*dsig(k)*D(i,j)
+           endif
+         enddo
+         qz(i,j) = qz(i,j)/(2./3.*FVegH(i,j)+1./3.*VegH)
+
+         ! non-dimensionalize load
+         qz(i,j) = qz(i,j)*VegH**3/EI
+       enddo
+       enddo
+
+       ! estimate height of flexible vegetation                                         
+       call veg_height(qz)
+
+       ! estimate effects of foliage                                                         
+       call foli(qz)
+     endif
+# endif
 
      ! solve total water depth D
      R1 = Zero
@@ -833,6 +1241,12 @@
          R2(i,j,k) = -1.0/dx*(Fx(i+1,j,k)-Fx(i,j,k))-1.0/dy*(Fy(i,j+1,k)-Fy(i,j,k)) &
                 -1.0/dsig(k)*(Fz(i,j,k+1)-Fz(i,j,k))+fcor*DV(i,j,k)+DRhoX(i,j,k)+  &
                 SourceX(i,j)+Diffxx(i,j,k)+Diffxy(i,j,k)+ExtForceX(i,j,k)
+# if defined (CORALREEF)
+         if(Hc(i,j)<0.12) then
+           Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+           R2(i,j,k) = R2(i,j,k)-0.5*Creef*Umag*U(i,j,k)
+         endif
+# endif
        enddo
      enddo
      enddo
@@ -845,6 +1259,12 @@
          R3(i,j,k) = -1.0/dx*(Gx(i+1,j,k)-Gx(i,j,k))-1.0/dy*(Gy(i,j+1,k)-Gy(i,j,k)) &   
                         -1.0/dsig(k)*(Gz(i,j,k+1)-Gz(i,j,k))-fcor*DU(i,j,k)+DRhoY(i,j,k)  &                                                
                         +SourceY(i,j)+Diffyx(i,j,k)+Diffyy(i,j,k)+ExtForceY(i,j,k)                                                           
+# if defined (CORALREEF)
+         if(Hc(i,j)<0.12) then
+           Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+           R3(i,j,k) = R3(i,j,k)-0.5*Creef*Umag*V(i,j,k)
+         endif
+# endif
        enddo
      enddo
      enddo
@@ -856,10 +1276,38 @@
        do k = Kbeg,Kend
          R4(i,j,k) = -1.0/dx*(Hx(i+1,j,k)-Hx(i,j,k))-1.0/dy*(Hy(i,j+1,k)-Hy(i,j,k)) &  
                         -1.0/dsig(k)*(Hz(i,j,k+1)-Hz(i,j,k))+Diffzx(i,j,k)+Diffzy(i,j,k)
+# if defined (CORALREEF)
+         if(Hc(i,j)<0.12) then
+           Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+           R4(i,j,k) = R4(i,j,k)-0.5*Creef*Umag*W(i,j,k)
+         endif
+# endif
        enddo
      enddo
      enddo
 
+# if defined (OBSTACLE)
+     allocate(RhsU(Mloc,Nloc,Kloc))
+     allocate(RhsV(Mloc,Nloc,Kloc))
+     allocate(RhsW(Mloc,Nloc,Kloc))
+
+     ! include pressure force
+     RhsU = R2+PresForceX
+     RhsV = R3+PresForceY
+     RhsW = R4+PresForceZ
+
+     ! calculate forcing at obstacle boundary
+     call imm_obs(RhsU,RhsV,RhsW)
+
+     ! adding the immersed-boundary forcing
+     R2 = R2+ObsForceX
+     R3 = R3+ObsForceY
+     R4 = R4+ObsForceZ
+
+     deallocate(RhsU)
+     deallocate(RhsV)
+     deallocate(RhsW)
+# endif
 
      ! solve DU
      do i = Ibeg,Iend
@@ -896,13 +1344,35 @@
              Bcoef(Nlen) = 1.0-Acoef(Nlen)-Ccoef(Nlen)
            endif
 
+# if defined (VEGETATION)
+           ! account for drag force
+           if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=Veg_Y0.and.Yc(j)<=Veg_Yn)) then
+             if(trim(Veg_Type)=='RIGID') then ! rigid vegetation 
+               if(sigc(k)*D(i,j)<=VegH) then
+                 Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+                 Bcoef(Nlen) = Bcoef(Nlen)+dt*0.5*Vegbv*VegDens*VegDrag*Umag+  &
+                                   VegVM*(0.25*pi*Vegbv**2)*VegDens
+               endif
+             else  ! flexible vegetation    
+               if(sigc(k)*D(i,j)<=FVegH(i,j)) then
+                 Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+                 Bcoef(Nlen) = Bcoef(Nlen)+dt*0.5*Vegbv*VegDens*VegDrag*foliage(i,j)*  &       
+                      VegH/FVegH(i,j)*Umag+VegVM*(0.25*pi*Vegbv**2)*VegDens
+               endif
+             endif
+           endif
+# endif
 
            if(k==Kbeg.and.Bc_Z0==5) then  ! friction law
              Dz1 = 0.5*D(i,j)*dsig(Kbeg)
              if(ibot==1) then
                Cdrag = Cd0
              else
+# if defined (SEDIMENT)
+               Cdrag = 1./(1./Kappa*(1.+Af*Richf(i,j,Kbeg))*log(30.0*Dz1/Zob))**2
+# else
                Cdrag = 1./(1./Kappa*log(30.0*Dz1/Zob))**2
+# endif
              endif
              Ustar2 = Cdrag*sqrt(U(i,j,k)**2+V(i,j,k)**2)*U(i,j,k)
              Rhs0(Nlen) = DU(i,j,k)+dt*R2(i,j,k)-dt*Ustar2/dsig(k)
@@ -912,6 +1382,20 @@
              Rhs0(Nlen) = DU(i,j,k)+dt*R2(i,j,k)
            endif
 
+# if defined (VEGETATION)
+           ! account for virtual mass force 
+           if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=Veg_Y0.and.Yc(j)<=Veg_Yn)) then       
+             if(trim(Veg_Type)=='RIGID') then ! rigid vegetation                                  
+               if(sigc(k)*D(i,j)<=VegH) then
+                 Rhs0(Nlen) = Rhs0(Nlen)+VegVM*(0.25*pi*Vegbv**2)*VegDens*DU(i,j,k)
+               endif
+             else  ! flexible vegetation                                          
+               if(sigc(k)*D(i,j)<=FVegH(i,j)) then
+                 Rhs0(Nlen) = Rhs0(Nlen)+VegVM*(0.25*pi*Vegbv**2)*VegDens*DU(i,j,k)             
+               endif
+             endif
+           endif
+# endif
          enddo
       
          call trig(Acoef,Bcoef,Ccoef,Rhs0,Xsol,Nlen)
@@ -923,7 +1407,15 @@
          enddo
        else
          do k = Kbeg,Kend
+# if defined (OBSTACLE)
+           if(set_flag(i,j,k)==1) then
+             DU(i,j,k) = D(i,j)*obs_u
+           else
+             DU(i,j,k) = DU(i,j,k)+dt*R2(i,j,k)
+           endif
+# else
            DU(i,j,k) = DU(i,j,k)+dt*R2(i,j,k)
+# endif
          enddo
        endif
      enddo
@@ -964,13 +1456,35 @@
              Bcoef(Nlen) = 1.0-Acoef(Nlen)-Ccoef(Nlen)
            endif
 
+# if defined (VEGETATION)
+           ! account for drag force       
+           if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=Veg_Y0.and.Yc(j)<=Veg_Yn)) then         
+             if(trim(Veg_Type)=='RIGID') then ! rigid vegetation                             
+               if(sigc(k)*D(i,j)<=VegH) then
+                 Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+                 Bcoef(Nlen) = Bcoef(Nlen)+dt*0.5*Vegbv*VegDens*VegDrag*Umag+  &
+                                 VegVM*(0.25*pi*Vegbv**2)*VegDens                                   
+               endif
+             else  ! flexible vegetation                                                           
+               if(sigc(k)*D(i,j)<=FVegH(i,j)) then
+                 Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+                 Bcoef(Nlen) = Bcoef(Nlen)+dt*0.5*Vegbv*VegDens*VegDrag*foliage(i,j)*  &            
+                      VegH/FVegH(i,j)*Umag+VegVM*(0.25*pi*Vegbv**2)*VegDens
+               endif
+             endif
+           endif
+# endif
 
            if(k==Kbeg.and.Bc_Z0==5) then
              Dz1 = 0.5*D(i,j)*dsig(Kbeg)
              if(ibot==1) then
                Cdrag = Cd0
              else
+# if defined (SEDIMENT)
+               Cdrag = 1./(1./Kappa*(1.+Af*Richf(i,j,Kbeg))*log(30.0*Dz1/Zob))**2
+# else
                Cdrag = 1./(1./Kappa*log(30.0*Dz1/Zob))**2
+# endif
              endif
              Ustar2 = Cdrag*sqrt(U(i,j,k)**2+V(i,j,k)**2)*V(i,j,k)
 
@@ -981,6 +1495,20 @@
              Rhs0(Nlen) = DV(i,j,k)+dt*R3(i,j,k)
            endif
 
+# if defined (VEGETATION)
+           ! account for virtual mass force                                                       
+           if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=Veg_Y0.and.Yc(j)<=Veg_Yn)) then      
+             if(trim(Veg_Type)=='RIGID') then ! rigid vegetation                          
+               if(sigc(k)*D(i,j)<=VegH) then
+                 Rhs0(Nlen) = Rhs0(Nlen)+VegVM*(0.25*pi*Vegbv**2)*VegDens*DV(i,j,k)           
+               endif
+             else  ! flexible vegetation                                    
+               if(sigc(k)*D(i,j)<=FVegH(i,j)) then
+                 Rhs0(Nlen) = Rhs0(Nlen)+VegVM*(0.25*pi*Vegbv**2)*VegDens*DV(i,j,k)          
+               endif
+             endif
+           endif
+# endif
 
          enddo
 
@@ -993,7 +1521,15 @@
          enddo
        else
          do k = Kbeg,Kend
+# if defined (OBSTACLE)
+           if(set_flag(i,j,k)==1) then
+             DV(i,j,k) = D(i,j)*obs_v
+           else
+             DV(i,j,k) = DV(i,j,k)+dt*R3(i,j,k)
+           endif
+# else
            DV(i,j,k) = DV(i,j,k)+dt*R3(i,j,k)
+# endif
          enddo
        endif
      enddo
@@ -1038,6 +1574,24 @@
              Bcoef(Nlen) = 1.0-Acoef(Nlen)-Ccoef(Nlen)
            endif
 
+# if defined (VEGETATION)
+           ! account for drag force
+           if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=Veg_Y0.and.Yc(j)<=Veg_Yn)) then    
+             if(trim(Veg_Type)=='RIGID') then ! rigid vegetation                              
+               if(sigc(k)*D(i,j)<=VegH) then
+                 Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+                 Bcoef(Nlen) = Bcoef(Nlen)+dt*0.5*Vegbv*VegDens*VegDrag*Umag+  &
+                                  VegVM*(0.25*pi*Vegbv**2)*VegDens                               
+               endif
+             else  ! flexible vegetation                                                     
+               if(sigc(k)*D(i,j)<=FVegH(i,j)) then
+                 Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+                 Bcoef(Nlen) = Bcoef(Nlen)+dt*0.5*Vegbv*VegDens*VegDrag*foliage(i,j)*  &         
+                      VegH/FVegH(i,j)*Umag+VegVM*(0.25*pi*Vegbv**2)*VegDens
+               endif
+             endif
+           endif
+# endif
 
            if(k==Kbeg) then
              Wbot = -DeltH(i,j)-U(i,j,Kbeg)*DelxH(i,j)-V(i,j,Kbeg)*DelyH(i,j) 
@@ -1055,6 +1609,20 @@
              Rhs0(Nlen) = DW(i,j,k)+dt*R4(i,j,k)
            endif
 
+# if defined (VEGETATION)
+           ! account for virtual mass force  
+           if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=Veg_Y0.and.Yc(j)<=Veg_Yn)) then      
+             if(trim(Veg_Type)=='RIGID') then ! rigid vegetation                               
+               if(sigc(k)*D(i,j)<=VegH) then
+                 Rhs0(Nlen) = Rhs0(Nlen)+VegVM*(0.25*pi*Vegbv**2)*VegDens*DW(i,j,k)             
+               endif
+             else  ! flexible vegetation                                                       
+               if(sigc(k)*D(i,j)<=FVegH(i,j)) then
+                 Rhs0(Nlen) = Rhs0(Nlen)+VegVM*(0.25*pi*Vegbv**2)*VegDens*DW(i,j,k)              
+               endif
+             endif
+           endif
+# endif
 
          enddo
 
@@ -1067,7 +1635,15 @@
          enddo
        else
          do k = Kbeg,Kend
+# if defined (OBSTACLE)
+           if(set_flag(i,j,k)==1) then
+             DW(i,j,k) = D(i,j)*obs_w
+           else
+             DW(i,j,k) = DW(i,j,k)+dt*R4(i,j,k)
+           endif
+# else
            DW(i,j,k) = DW(i,j,k)+dt*R4(i,j,k)
+# endif
          enddo 
        endif
      enddo
@@ -1341,7 +1917,9 @@
      call HLL(Mloc,Nloc1,Kloc,SyL,SyR,EyL,EyR,D3yL,D3yR,Ey)
 
      ! left and right side
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        if(Bc_X0==1.or.Bc_X0==2) then
@@ -1351,9 +1929,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        if(Bc_Xn==1.or.Bc_Xn==2) then
@@ -1363,10 +1945,14 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! front and back side  
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        if(Bc_Y0==1.or.Bc_Y0==2) then
@@ -1374,9 +1960,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        if(Bc_Yn==1.or.Bc_Yn==2) then
@@ -1384,7 +1974,9 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! update Omega
      Omega = zero
@@ -1442,12 +2034,14 @@
 
      ! collect data into ghost cells
      call vel_bc
+# if defined (PARALLEL)
      call phi_3D_exch(U)
      call phi_3D_exch(V)
      call phi_3D_exch(W)
      call phi_3D_exch(DU)
      call phi_3D_exch(DV)
      call phi_3D_exch(DW)
+# endif
 
      end subroutine get_UVW
 
@@ -1761,6 +2355,7 @@
      end subroutine delxFun_2D
 
 
+! hackathon profiling self 8.23%
      subroutine delxFun_3D(Din,Dout)
 !------------------------------------------
 !    Second-order derivative in x
@@ -1845,6 +2440,8 @@
      end subroutine delyFun_2D
 
 
+
+! hackathon profiling self 4.36%
      subroutine delyFun_3D(Din,Dout)
 !-------------------------------------------
 !    Second-order derivative in y
@@ -1941,7 +2538,9 @@
      integer :: i,j,k
 
      ! left and right side
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        if(Bc_X0==1.or.Bc_X0==2) then
@@ -1958,9 +2557,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        if(Bc_Xn==1.or.Bc_Xn==2) then
@@ -1978,10 +2581,14 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! front and back side
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        if(Bc_Y0==1.or.Bc_Y0==2) then
@@ -1993,9 +2600,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        if(Bc_Yn==1.or.Bc_Yn==2) then
@@ -2007,7 +2618,9 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! upper and bottom
      do j = Jbeg,Jend
@@ -2026,7 +2639,11 @@
      do i = Ibeg-1,Iend+1
        if(Mask(i,j)==0) then
          Ex(i,j,k) = Zero
+# if defined (PARALLEL)
          if(i==Ibeg.and.n_west.eq.MPI_PROC_NULL) then
+# else
+         if(i==Ibeg) then
+# endif
            Fx(i,j,k) = Zero
          else
            Fx(i,j,k) = 0.5*Grav*(EtaxL(i,j)*EtaxL(i,j)+  &
@@ -2036,7 +2653,11 @@
          Hx(i,j,k) = Zero
 
          Ex(i+1,j,k) = Zero
+# if defined (PARALLEL)
          if(i==Iend.and.n_east.eq.MPI_PROC_NULL) then
+# else
+         if(i==Iend) then
+# endif
            Fx(i+1,j,k) = Zero
          else
            Fx(i+1,j,k) = 0.5*Grav*(EtaxR(i+1,j)*EtaxR(i+1,j)+  &
@@ -2047,7 +2668,11 @@
 
          Ey(i,j,k) = Zero
          Fy(i,j,k) = Zero
+# if defined (PARALLEL)
          if(j==Jbeg.and.n_suth.eq.MPI_PROC_NULL) then
+# else
+         if(j==Jbeg) then
+# endif   
            Gy(i,j,k) = Zero
          else
            Gy(i,j,k) = 0.5*Grav*(EtayL(i,j)*EtayL(i,j)+  &
@@ -2057,7 +2682,11 @@
 
          Ey(i,j+1,k) = Zero
          Fy(i,j+1,k) = Zero
+# if defined (PARALLEL)
          if(j==Jend.and.n_nrth.eq.MPI_PROC_NULL) then
+# else
+         if(j==Jend) then
+# endif
            Gy(i,j+1,k) = Zero
          else
            Gy(i,j+1,k) = 0.5*Grav*(EtayR(i,j+1)*EtayR(i,j+1)+  &
@@ -2469,8 +3098,10 @@
          endif
        enddo
 
+# if defined (PARALLEL)
        call MPI_ALLREDUCE(Source_Area,myvar,1,MPI_SP,MPI_SUM,MPI_COMM_WORLD,ier)
        Source_Area = myvar/float(PY)
+# endif
 
        do j = Jbeg,Jend
        do i = Ibeg,Iend
@@ -2492,8 +3123,10 @@
          endif
        enddo
 
+# if defined (PARALLEL)
        call MPI_ALLREDUCE(Source_Area,myvar,1,MPI_SP,MPI_SUM,MPI_COMM_WORLD,ier)  
        Source_Area = myvar/float(PY)
+# endif
 
        do j = Jbeg,Jend
        do i = Ibeg,Iend
@@ -2609,8 +3242,10 @@
          endif
        enddo
 
+# if defined (PARALLEL)
        call MPI_ALLREDUCE(Source_Area,myvar,1,MPI_SP,MPI_SUM,MPI_COMM_WORLD,ier)  
        Source_Area = myvar/float(PY)
+# endif
 
        dfreq = (Freq_Max-Freq_Min)/float(NumFreq)
 
@@ -2657,7 +3292,7 @@
        ! wave number
        Wave_Number = 2.0*pi/Wave_Length
 
-!# if defined(1)
+!# if defined(PARALLEL)
 !       if(myid.eq.0) write(*,*) 'Mod=',Mod1,'Ytrough=',Ytrough, &
 !            'Wave_Number=',wave_number
 !# endif      
@@ -2694,8 +3329,10 @@
          endif
        enddo
 
+# if defined (PARALLEL)
        call MPI_ALLREDUCE(Source_Area,myvar,1,MPI_SP,MPI_SUM,MPI_COMM_WORLD,ier) 
        Source_Area = myvar/float(PY)
+# endif
 
        do j = Jbeg,Jend
        do i = Ibeg,Iend
@@ -2721,8 +3358,10 @@
          endif
        enddo
 
+# if defined (PARALLEL)
        call MPI_ALLREDUCE(Source_Area,myvar,1,MPI_SP,MPI_SUM,MPI_COMM_WORLD,ier) 
        Source_Area = myvar/float(PY)
+# endif
 
        do j = Jbeg,Jend
        do i = Ibeg,Iend
@@ -2761,6 +3400,9 @@
 
      allocate(U_Dep_Ave(Mloc,Nloc))
      allocate(V_Dep_Ave(Mloc,Nloc))
+# if defined (SEDIMENT)
+     allocate(S_Dep_Ave(Mloc,Nloc))
+# endif
 
      if(TIME>Wave_Ave_Start.and.TIME<=Wave_Ave_End) then
        ! Lagrangian mean velocity
@@ -2788,10 +3430,16 @@
            U_zk = U(i,j,Kbeg)
            V_zk = V(i,j,Kbeg)
            W_zk = W(i,j,Kbeg)
+# if defined (SEDIMENT)
+           S_zk = Conc(i,j,Kbeg)
+# endif
          elseif(Zk>=Zend) then
            U_zk = U(i,j,Kend)
            V_zk = V(i,j,Kend)
            W_zk = W(i,j,Kend)
+# if defined (SEDIMENT)
+           S_zk = Conc(i,j,Kend)
+# endif
          else
            do n = Kbeg,Kend-1
              Zn = sigc(n)*(Eta(i,j)+Hc(i,j)) 
@@ -2801,12 +3449,18 @@
                U_zk = U(i,j,n)*(1.0-Sinterp)+U(i,j,n+1)*Sinterp
                V_zk = V(i,j,n)*(1.0-Sinterp)+V(i,j,n+1)*Sinterp
                W_zk = W(i,j,n)*(1.0-Sinterp)+W(i,j,n+1)*Sinterp
+# if defined (SEDIMENT)
+               S_zk = Conc(i,j,n)*(1.0-Sinterp)+Conc(i,j,n+1)*Sinterp
+# endif
              endif 
            enddo
          endif
          Euler_Umean(i,j,k) = Euler_Umean(i,j,k)+U_zk*dt/(Wave_Ave_End-Wave_Ave_Start)
          Euler_Vmean(i,j,k) = Euler_Vmean(i,j,k)+V_Zk*dt/(Wave_Ave_End-Wave_Ave_Start)
          Euler_Wmean(i,j,k) = Euler_Wmean(i,j,k)+W_Zk*dt/(Wave_Ave_End-Wave_Ave_Start)
+# if defined (SEDIMENT)
+         Euler_Smean(i,j,k) = Euler_Smean(i,j,k)+S_Zk*dt/(Wave_Ave_End-Wave_Ave_Start)
+# endif        
        enddo
        enddo
        enddo         
@@ -2814,11 +3468,17 @@
        ! depth-averaged velocity
        U_Dep_Ave = Zero
        V_Dep_Ave = Zero
+# if defined (SEDIMENT)
+       S_Dep_Ave = Zero
+# endif
        do j = Jbeg,Jend
        do i = Ibeg,Iend
          do k = Kbeg,Kend
            U_Dep_Ave(i,j) = U_Dep_Ave(i,j)+U(i,j,k)/float(Kend-Kbeg+1)
            V_Dep_Ave(i,j) = V_Dep_Ave(i,j)+V(i,j,k)/float(Kend-Kbeg+1)
+# if defined (SEDIMENT)
+           S_Dep_Ave(i,j) = S_Dep_Ave(i,j)+Conc(i,j,k)/float(Kend-Kbeg+1)
+# endif
          enddo
        enddo
        enddo
@@ -2828,6 +3488,9 @@
          Setup(i,j) = Setup(i,j)+Eta(i,j)*dt/(Wave_Ave_End-Wave_Ave_Start)
          Umean(i,j) = Umean(i,j)+U_Dep_Ave(i,j)*dt/(Wave_Ave_End-Wave_Ave_Start)
          Vmean(i,j) = Vmean(i,j)+V_Dep_Ave(i,j)*dt/(Wave_Ave_End-Wave_Ave_Start)
+# if defined (SEDIMENT)
+         Smean(i,j) = Smean(i,j)+S_Dep_Ave(i,j)*dt/(Wave_Ave_End-Wave_Ave_Start)
+# endif
 
          if(Eta(i,j)>Emax(i,j)) Emax(i,j) = Eta(i,j)
          if(Eta(i,j)<Emin(i,j)) Emin(i,j) = Eta(i,j)
@@ -2854,6 +3517,9 @@
 
      deallocate(U_Dep_Ave)
      deallocate(V_Dep_Ave)
+# if defined (SEDIMENT)
+     deallocate(S_Dep_Ave)
+# endif
 
      end subroutine wave_average
 
@@ -2899,6 +3565,10 @@
      file = TRIM(FDIR)//'vmean'
      call putfile2D(file,Vmean)
 
+# if defined (SEDIMENT)
+     file = TRIM(FDIR)//'smean'
+     call putfile2D(file,Smean)
+# endif
 
      file = TRIM(FDIR)//'lag_umean'
      call putfile3D(file,Lag_Umean)
@@ -2918,6 +3588,10 @@
      file = TRIM(FDIR)//'euler_wmean'
      call putfile3D(file,Euler_Wmean)
 
+# if defined (SEDIMENT)
+     file = TRIM(FDIR)//'euler_smean'
+     call putfile3D(file,Euler_Smean)
+# endif
 
      end subroutine print_wh_setup
 
@@ -2934,7 +3608,9 @@
      real(SP) :: MassVolume,CellMass,Energy,MaxEta,MinEta,MaxU, &
                  MaxV,MaxW,MaxS,MinS
      integer :: i,j,k
+# if defined (PARALLEL)
      real(SP) :: myvar
+# endif
 
      ! Vol = sum(D*dx*dy)
      ! Energy = sum(m*g*h+0.5*m*u^2), reference is at z = 0
@@ -2956,8 +3632,13 @@
      MaxU = MAXVAL(abs(U(Ibeg:Iend,Jbeg:Jend,Kbeg:Kend)))
      MaxV = MAXVAL(abs(V(Ibeg:Iend,Jbeg:Jend,Kbeg:Kend)))
      MaxW = MAXVAL(abs(W(Ibeg:Iend,Jbeg:Jend,Kbeg:Kend))) 
+# if defined (SALINITY)
+     MaxS = MAXVAL(abs(Sali(Ibeg:Iend,Jbeg:Jend,Kbeg:Kend)))
+     MinS = MINVAL(abs(Sali(Ibeg:Iend,Jbeg:Jend,Kbeg:Kend)))
+# endif
 
 
+# if defined (PARALLEL)
      call MPI_ALLREDUCE(MassVolume,myvar,1,MPI_SP,MPI_SUM,MPI_COMM_WORLD,ier)        
      MassVolume = myvar
      call MPI_ALLREDUCE(Energy,myvar,1,MPI_SP,MPI_SUM,MPI_COMM_WORLD,ier)            
@@ -2972,8 +3653,17 @@
      MaxV = myvar
      call MPI_ALLREDUCE(MaxW,myvar,1,MPI_SP,MPI_MAX,MPI_COMM_WORLD,ier)
      MaxW = myvar
+# if defined (SALINITY)
+     call MPI_ALLREDUCE(MaxS,myvar,1,MPI_SP,MPI_MAX,MPI_COMM_WORLD,ier)
+     MaxS = myvar
+     call MPI_ALLREDUCE(MinS,myvar,1,MPI_SP,MPI_MIN,MPI_COMM_WORLD,ier)                                                 
+     MinS = myvar
+# endif
+# endif
 
+# if defined (PARALLEL)
      if(myid.eq.0) then
+# endif
      ! print screen
      WRITE(*,*),'----------------- STATISTICS ----------------'
      WRITE(*,*),' TIME        DT         DT_CONSTRAINT'
@@ -2987,7 +3677,9 @@
      WRITE(3,102) TIME,dt,TRIM(dt_constraint)
      WRITE(3,103) ' MassVolume  Energy      MaxEta      MinEta      MaxU       MaxV       MaxW       MaxS       MinS'
      WRITE(3,101), MassVolume,Energy,MaxEta,MinEta,MaxU,MaxV,MaxW,MaxS,MinS
+# if defined (PARALLEL)
      endif
+# endif
 
 101  FORMAT(10E12.4)
 102  FORMAT(2E12.4,A8)
@@ -3050,8 +3742,13 @@
      ! results directory
      FDIR = TRIM(RESULT_FOLDER)
 
+# if defined (PARALLEL)
      if(myid.eq.0) write(*,102) 'Printing file No.',Icount,' TIME/TOTAL: ',TIME,'/',TOTAL_TIME
      if(myid.eq.0) write(3,102) 'Printing file No.',Icount,' TIME/TOTAL: ',TIME,'/',TOTAL_TIME     
+# else
+     write(*,102) 'Printing file No.',Icount,' TIME/TOTAL: ',TIME,'/',TOTAL_TIME
+     write(3,102) 'Printing file No.',Icount,' TIME/TOTAL: ',TIME,'/',TOTAL_TIME
+# endif
 102  FORMAT(A20,I5,A14,F8.3,A2,F8.3)
 100  FORMAT(5000E16.6)
 
@@ -3067,11 +3764,15 @@
      write(FILE_NAME(4:4),'(I1)') I4
      write(FILE_NAME(5:5),'(I1)') I5
 
+# if defined (PARALLEL)
      if(myid.eq.0) then
+# endif
      open(5,file=TRIM(FDIR)//'time',position="append")
      write(5,*) TIME
      close(5)
+# if defined (PARALLEL)
      endif
+# endif
 
      if(Icount==1) then
        if(OUT_H) then
@@ -3130,15 +3831,74 @@
        call putfile3D(file,UpWp)
      endif
 
+# if defined (VEGETATION)
+     if(TRIM(Veg_Type)=='FLEXIBLE') then
+       file=TRIM(FDIR)//'vegh_'//TRIM(FILE_NAME)
+       call putfile2D(file,FVegH)
+     endif
+# endif
 
+# if defined (BUBBLE)
+     if(OUT_B) then
+       file=TRIM(FDIR)//'b_'//TRIM(FILE_NAME)
+       call putfile3D(file,Vbg)
+     endif
+# endif
 
+# if defined (SEDIMENT)
+     if(OUT_F) then
+       file=TRIM(FDIR)//'f_'//TRIM(FILE_NAME)
+       call putfile3D(file,Conc)
+     endif
+     if(OUT_T) then
+       file=TRIM(FDIR)//'t_'//TRIM(FILE_NAME)
+       call putfile2D(file,Taub)
+     endif
+!     if(OUT_G) then
+!       file=TRIM(FDIR)//'g_'//TRIM(FILE_NAME)
+!       call putfile2D(file,Bed)
+!       file=TRIM(FDIR)//'qbed_'//TRIM(FILE_NAME)
+!       call putfile2D(file,Qbedx)
+!     endif
+# endif
 
+# if defined (SALINITY)
+     if(OUT_I) then
+       file=TRIM(FDIR)//'i_'//TRIM(FILE_NAME)
+       call putfile3D(file,Sali)
+     endif
+# endif
 
+# if defined (BALANCE2D)
+     file=TRIM(FDIR)//'dudt2d_'//TRIM(FILE_NAME)
+     call putfile2D(file,DUDT2D)
+     file=TRIM(FDIR)//'dedx2d_'//TRIM(FILE_NAME)
+     call putfile2D(file,DEDX2D)
+     file=TRIM(FDIR)//'dpdx2d_'//TRIM(FILE_NAME)
+     call putfile2D(file,DPDX2D)
+     file=TRIM(FDIR)//'diffx2d_'//TRIM(FILE_NAME)
+     call putfile2D(file,DIFFX2D)
+     file=TRIM(FDIR)//'taubx2d_'//TRIM(FILE_NAME)
+     call putfile2D(file,TAUBX2D)
+# if defined (VEGETATION)
+     file=TRIM(FDIR)//'fvegx2d_'//TRIM(FILE_NAME)
+     call putfile2D(file,FVEGX2D)
+# endif
+# endif
 
+# if defined (TWOLAYERSLIDE)
+     file=TRIM(FDIR)//'Ha_'//TRIM(FILE_NAME)
+     call putfile2D(file,Hs)
+     file=TRIM(FDIR)//'Ua_'//TRIM(FILE_NAME)
+     call putfile2D(file,Ua)
+     file=TRIM(FDIR)//'Va_'//TRIM(FILE_NAME)
+     call putfile2D(file,Va)
+# endif
 
      end subroutine preview
 
 
+# if defined (PARALLEL)
     subroutine putfile2D(file,phi)
     use global
     implicit none
@@ -3285,6 +4045,39 @@
     deallocate(xx)
 
     end subroutine putfile3D
+# else
+     subroutine putfile2D(file,phi)
+     use global
+     implicit none
+     real(SP),dimension(Mloc,Nloc),intent(in) :: phi
+     character(len=80) :: file
+     integer :: i,j
+
+     open(5,file=trim(file))
+     do j = Jbeg,Jend
+       write(5,100) (phi(i,j),i=Ibeg,Iend)
+     enddo
+     close(5)
+ 100 FORMAT(5000f15.6)
+     end subroutine putfile2D
+
+     subroutine putfile3D(file,phi)
+     use global
+     implicit none
+     real(SP),dimension(Mloc,Nloc,Kloc),intent(in) :: phi
+     character(len=80) :: file
+     integer :: i,j,k
+
+     open(5,file=trim(file))
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend
+       write(5,100) (phi(i,j,k),i=Ibeg,Iend)
+     enddo
+     enddo
+     close(5)
+ 100 FORMAT(5000f15.6)
+     end subroutine putfile3D  
+# endif
 
  
      subroutine estimate_dt
@@ -3298,7 +4091,9 @@
      implicit none
      integer :: i,j,k
      real(SP) :: tmp1,tmp2,dxonu,dyonv,dzonw,dt_growth,dt_courant,dt_viscous
+# if defined (PARALLEL)
      real(SP) :: myvar
+# endif
 
      ! save previous time step
      dt_old = dt
@@ -3325,9 +4120,26 @@
      enddo
      enddo
 
+# if defined (TWOLAYERSLIDE)
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       tmp1 = abs(Ua(i,j))+sqrt(Grav*Ha(i,j))
+       tmp1 = max(tmp1,Small)
+       dxonu = dx/tmp1
+       if(dxonu<tmp2) tmp2=dxonu
 
+       tmp1 = abs(Va(i,j))+sqrt(Grav*Ha(i,j))
+       tmp1 = max(tmp1,Small)
+       dyonv = dy/tmp1
+       if(dyonv<tmp2) tmp2=dyonv
+     enddo
+     enddo
+# endif
+
+# if defined (PARALLEL)
      call MPI_ALLREDUCE(tmp2,myvar,1,MPI_SP,MPI_MIN,MPI_COMM_WORLD,ier)
      tmp2 = myvar
+# endif
      dt_courant = CFL*tmp2
 
      ! time step limit due to explicit viscous stress terms
@@ -3345,22 +4157,33 @@
        enddo
        enddo
        enddo
+# if defined (PARALLEL)
        call MPI_ALLREDUCE(tmp2,myvar,1,MPI_SP,MPI_MIN,MPI_COMM_WORLD,ier)
        tmp2 = myvar
+# endif
        dt_viscous = VISCOUS_NUMBER*tmp2
      endif 
 
      ! get dt    
      dt = min(dt_growth,dt_courant,dt_viscous,dt_max)
      if(dt<dt_min) then
+# if defined (PARALLEL)
        if(myid.eq.0) then
          write(3,*) 'time step too small !!',dt,dt_courant,dt_viscous
          stop
        endif
+# else
+       write(3,*) 'time step too small !!',dt,dt_courant,dt_viscous
+       stop
+# endif
      endif
      TIME = TIME+dt
      RUN_STEP = RUN_STEP+1 
+# if defined (PARALLEL)
      if(myid.eq.0) write(3,*) RUN_STEP,dt,TIME
+# else 
+     write(3,*) RUN_STEP,dt,TIME
+# endif
 
      if(dt==dt_growth) then
        dt_constraint = 'GROWTH'
@@ -3388,7 +4211,9 @@
      real(SP) :: Wtop,Wbot,Cdrag,Phi,Dz1,Cg
 
      ! left and right boundary
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do k = Kbeg,Kend
      do j = Jbeg,Jend
        if(Bc_X0==1) then  ! free-slip wall
@@ -3450,9 +4275,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do k = Kbeg,Kend
      do j = Jbeg,Jend
        if(Bc_Xn==1) then  ! free-slip wall 
@@ -3525,9 +4354,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      do k = Kbeg,Kend
      do i = Ibeg,Iend
        if(Bc_Y0==1) then  ! free-slip wall 
@@ -3560,9 +4393,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      do k = Kbeg,Kend
      do i = Ibeg,Iend
        if(Bc_Yn==1) then  ! free-slip wall 
@@ -3595,7 +4432,9 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
      ! top and bottom
      do j = Jbeg,Jend
@@ -3604,7 +4443,11 @@
        if(ibot==1) then
          Cdrag = Cd0
        else
+# if defined (SEDIMENT)
+         Cdrag = 1./(1./Kappa*(1.+Af*Richf(i,j,Kbeg))*log(30.0*Dz1/Zob))**2                                                          
+# else
          Cdrag = 1./(1./Kappa*log(30.0*Dz1/Zob))**2
+# endif
        endif
        Phi = 2.0*Dz1*Cdrag*sqrt(U(i,j,Kbeg)**2+V(i,j,Kbeg)**2)/(Cmu(i,j,Kbeg)+CmuVt(i,j,Kbeg))
        Phi = dmin1(Phi,2.0)
@@ -3765,7 +4608,9 @@
      integer :: i,j
 
      ! left and right boundary
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
        if(Bc_X0==1.or.Bc_X0==2) then  ! free/no-slip wall
          do i = 1,Nghost
@@ -3791,9 +4636,13 @@
          enddo
        endif
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
        if(Bc_Xn==1.or.Bc_Xn==2) then 
          do i = 1,Nghost
@@ -3822,26 +4671,38 @@
          enddo
        endif
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
 ! y-direction and corners                                                                                                     
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif     
        do i = 1,Mloc
        do j = 1,Nghost
          D(i,j) = D(i,Jbeg+Nghost-j)
        enddo
        enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
        do i = 1,Mloc
        do j = 1,Nghost
          D(i,Jend+j) = D(i,Jend-j+1)
        enddo
        enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      call phi_2D_exch(D)
+# endif
      
      return
      end subroutine wl_bc
@@ -3859,40 +4720,58 @@
      integer :: i,j
 
      ! x-direction
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
        do j = Jbeg,Jend
        do i = 1,Nghost
          phi(i,j) = phi(Ibeg+Nghost-i,j)
        enddo
        enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
        do j = Jbeg,Jend
        do i = 1,Nghost
          phi(Iend+i,j) = phi(Iend-i+1,j)
        enddo
        enddo
+# if defined (PARALLEL)
      endif
+# endif
  
      ! y-direction and corners
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif     
        do i = 1,Mloc
        do j = 1,Nghost
          phi(i,j) = phi(i,Jbeg+Nghost-j)
        enddo
        enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
        do i = 1,Mloc
        do j = 1,Nghost
          phi(i,Jend+j) = phi(i,Jend-j+1)
        enddo
        enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      call phi_2D_exch(phi)
+# endif    
 
      end subroutine phi_2D_coll
 
@@ -3927,6 +4806,7 @@
        enddo
        enddo
 
+# if defined (PARALLEL)
        do j = Jbeg,Jend
        do i = Ibeg,Iend
          iglob = npx*(Mloc-2*Nghost)+i-Nghost
@@ -3935,6 +4815,16 @@
          WdV(i,j) = WVG(iglob,jglob)
        enddo
        enddo
+# else
+       do j = Jbeg,Jend
+       do i = Ibeg,Iend
+         iglob = i-Nghost
+         jglob = j-Nghost
+         WdU(i,j) = WUG(iglob,jglob)
+         WdV(i,j) = WVG(iglob,jglob)
+       enddo
+       enddo
+# endif
 
      endif
 
@@ -3992,8 +4882,10 @@
 
      Mask = Mask*Mask_Struct
 
+# if defined (PARALLEL)
      ! collect mask into ghost cells
      call phi_int_exch(Mask)    
+# endif
 
      do j = Jbeg,Jend
      do i = Ibeg,Iend
@@ -4033,9 +4925,26 @@
      DTke0 = DTke
      DEps0 = DEps
 
+# if defined (BUBBLE)
+     DNbg0 = DNbg
+# endif
 
+# if defined (SEDIMENT)
+     DConc0 = DConc
+     Bed0 = Bed
+# endif
 
+# if defined (SALINITY)
+     DSali0 = Dsali
+# endif
 
+# if defined (TWOLAYERSLIDE)
+     Ha0 = Ha
+     HUa0 = HUa
+     HVa0 = HVa
+     Ua0 = Ua
+     Va0 = Va
+# endif
 
      end subroutine update_vars
 
@@ -4050,7 +4959,9 @@
      use global
      implicit none
 
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      if(WaveMaker(1:7)=='LEF_SOL') then
        call solitary_wave_left_boundary
      elseif(WaveMaker(1:7)=='LEF_LIN') then
@@ -4066,14 +4977,20 @@
      elseif(WaveMaker(1:7)=='LEF_TID') then
        call tidal_wave_left_boundary
      endif
+# if defined (PARALLEL)
      endif
+# endif
 
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      if(WaveMaker(1:7)=='RIG_LIN') then
        call linear_wave_right_boundary
      endif
+# if defined (PARALLEL)
      endif
+# endif
 
 
      if(WaveMaker(1:7)=='FLUX_LR') then
@@ -4095,6 +5012,10 @@
      integer :: j,k,n
      real(SP) :: Zlev1,Zlev2,Uavg_Left,Uavg_Right,Ufric,sintep,UU,  &
                  FluxL,FluxR,myvar,Ramp
+# if defined (SEDIMENT)
+     real(SP) :: Sinterp
+     real(SP) :: Tim0(8),Cin0(8)
+# endif
 
      Uavg_Left = 0.116
      Uavg_Right = 0.116
@@ -4108,7 +5029,9 @@
        Ramp = 1.0
      endif
 
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do j = 1,Nloc
        Ein_X0(j) = 1.5*Eta(Ibeg,j)-0.5*Eta(Ibeg+1,j)
        Din_X0(j) = Ein_X0(j)+Hfx(Ibeg,j)
@@ -4125,15 +5048,46 @@
        Win_X0(j,k) = 0.0
        Vin_X0(j,k) = 0.0
 
+# if defined (SALINITY)
+       Sin_X0(j,k) = 0.0
+# endif
 
+# if defined (SEDIMENT)
+       open(41,file='cin0.txt')
+       do n = 1,8
+         read(41,*) Tim0(n),Cin0(n)
+         Tim0(n) = Tim0(n)*3600.
+         Cin0(n) = Cin0(n)/Srho
+       enddo
+       close(41)       
+
+       if(TIME<=Tim0(1)) then
+         Sed_X0(j,k) = Cin0(1)
+       elseif(TIME>=Tim0(8)) then
+         Sed_X0(j,k) = Cin0(8)
+       else
+         do n = 2,8
+           if(TIME>Tim0(n-1).and.TIME<=Tim0(n)) then
+             Sinterp = (TIME-Tim0(n-1))/(Tim0(n)-Tim0(n-1))
+             Sed_X0(j,k) = Cin0(n-1)*(1.0-Sinterp)+Cin0(n)*Sinterp
+           endif
+         enddo
+       endif
+# endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)     
      call MPI_ALLREDUCE(FluxL,myvar,1,MPI_SP,MPI_SUM,MPI_COMM_WORLD,ier)
      FluxL = myvar
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
 
 !     if(TIME>TRamp) then
 !       call linear_wave_right_boundary
@@ -4152,10 +5106,18 @@
        Win_Xn(j,k) = 0.0
        Vin_Xn(j,k) = 0.0
 
+# if defined (SALINITY)
+       Sin_Xn(j,k) = 30.0
+# endif
 
+# if defined (SEDIMENT)
+       Sed_Xn(j,k) = Conc(Iend,j,k)
+# endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
      
      return
      end subroutine flux_left_right_boundary
@@ -4246,6 +5208,13 @@
      enddo
      enddo
 
+# if defined (SEDIMENT)
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend
+       Sed_X0(j,k) = 0.5/2650.
+     enddo
+     enddo
+# endif
 
      end subroutine tidal_wave_left_boundary
 
@@ -4520,7 +5489,9 @@
      use global, only: SP,pi,Zero,small,Ibeg,Grav,TIME,Nloc,Kloc,NumFreq,NumDir,Freq,Dire,Wave_Spc2d, & 
                        Ein_X0,Din_X0,Uin_X0,Vin_X0,Win_X0,Hfx,Jbeg,Jend,Kbeg,Kend,sigc,dy, &
                        MaxNumFreq,MaxNumDir,Nglob,Dep_Wave,Random_Phs
+# if defined (PARALLEL)
      use global, only: myid
+# endif
      implicit none
      integer :: nfreq,ndir,Iter,nk,i,j,k
      real(SP) :: Per_Wave,Segma,Celerity,Wave_Length,Wave_Number,Fk,Fkdif,Angle,tmp1,tmp2,tmp3,tmp4,Fact, &
@@ -4840,6 +5811,13 @@
      enddo
      enddo         
 
+# if defined (SALINITY)
+     do k = Kbeg,Kend
+     do j = Jbeg,Jend
+       Sin_X0(j,k) = Sali(Ibeg,j,k)
+     enddo
+     enddo
+# endif
 
      end subroutine linear_wave_left_boundary
 
@@ -4885,6 +5863,88 @@
 
      end subroutine solitary_wave_left_boundary
 
+# if defined (LANDSLIDE) 
+     subroutine update_bathymetry
+!------------------------------------------------------
+!    This subroutine is used to update time-varying bathymetry 
+!    Called by 
+!       main 
+!    Last update: 12/05/2011, Gangfeng Ma 
+!-----------------------------------------------------
+     use global
+     implicit none
+     integer :: i,j,m,n,iter
+     real(SP) :: alpha0,L0,T,bl,wl,e,kb,kw,x0,y0,xt,yt,zt,ut,t0,a0, &
+           s0,st,slope0
+     
+     ! save old bathymetry
+     Ho = Hc
+
+     e = 0.717
+     alpha0 = SlideAngle*pi/180.
+     slope0 = SlopeAngle*pi/180. 
+     kb = 2.0*acosh(1.0/e)/SlideL
+     kw = 2.0*acosh(1.0/e)/SlideW
+     ut = SlideUt
+     a0 = SlideA0
+     t0 = ut/a0
+     s0 = ut**2/a0
+     st = s0*log(cosh(time/t0))*cos(slope0)
+     x0 = SlideX0+st*cos(alpha0)
+     y0 = SlideY0+st*sin(alpha0)
+
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       xt = (xc(i)-x0)*cos(alpha0)+(yc(j)-y0)*sin(alpha0)
+       yt = -(xc(i)-x0)*sin(alpha0)+(yc(j)-y0)*cos(alpha0)
+       zt = SlideT/(1-e)*(1.0/cosh(kb*xt)/cosh(kw*yt)-e)
+       Hc(i,j) = Hc0(i,j)-max(0.0,zt)
+     enddo
+     enddo
+
+     ! ghost cells
+     call phi_2D_coll(Hc)
+
+     ! reconstruct depth at x-y faces
+     do j = 1,Nloc
+     do i = 2,Mloc
+       Hfx(i,j) = 0.5*(Hc(i,j)+Hc(i+1,j))
+     enddo
+     Hfx(1,j) = Hfx(2,j)
+     Hfx(Mloc1,j) = Hfx(Mloc,j)
+     enddo
+
+     do i = 1,Mloc
+     do j = 2,Nloc
+       Hfy(i,j) = 0.5*(Hc(i,j)+Hc(i,j+1))
+     enddo
+     Hfy(i,1) = Hfy(i,2)
+     Hfy(i,Nloc1) = Hfy(i,Nloc)
+     enddo
+
+     ! derivatives of water depth at cell center
+     do j = 1,Nloc
+     do i = 1,Mloc
+       DelxH(i,j) = (Hfx(i+1,j)-Hfx(i,j))/dx
+       DelyH(i,j) = (Hfy(i,j+1)-Hfy(i,j))/dy
+     enddo
+     enddo
+
+     ! time derivative of water depth
+     DeltHo = DeltH
+
+     DeltH = zero
+     do j = 1,Nloc
+     do i = 1,Mloc
+       DeltH(i,j) = (Hc(i,j)-Ho(i,j))/dt
+     enddo
+     enddo
+
+     ! second-order time derivative
+     if(RUN_STEP>2) Delt2H = (DeltH-DeltHo)/dt
+
+     end subroutine update_bathymetry
+# endif
  
      subroutine read_bathymetry
 !------------------------------------------------------ 
@@ -4899,6 +5959,9 @@
      integer :: Maskp(Mglob+1,Nglob+1)
      real(SP), dimension(Mglob+1,Nglob+1) :: HG
 
+# if defined (LANDSLIDE)
+     real(SP) :: alpha0,L0,T,bl,wl,e,kb,kw,x0,xr,xt,yt,zt
+# endif
 
      ! read bathymetry at grid points
      if(trim(adjustl(DEPTH_TYPE))=='CELL_GRID') then
@@ -4932,6 +5995,7 @@
        enddo
        enddo
 
+# if defined (PARALLEL)
        do j = Jbeg,Jend
        do i = Ibeg,Iend
          iglob = npx*(Mloc-2*Nghost)+i-Nghost
@@ -4939,6 +6003,15 @@
          Hc(i,j) = HCG(iglob,jglob)
        enddo
        enddo
+# else
+       do j = Jbeg,Jend
+       do i = Ibeg,Iend
+         iglob = i-Nghost
+         jglob = j-Nghost
+         Hc(i,j) = HCG(iglob,jglob)
+       enddo
+       enddo
+# endif
 
      elseif(trim(adjustl(DEPTH_TYPE))=='CELL_CENTER') then
        ! read bathymetry at cell center
@@ -4954,6 +6027,7 @@
            read(5,*) (HCG(i,j),i=1,Mglob)
          enddo
 
+# if defined (PARALLEL)
          do j = Jbeg,Jend
          do i = Ibeg,Iend
            iglob = npx*(Mloc-2*Nghost)+i-Nghost
@@ -4961,6 +6035,15 @@
            Hc(i,j) = HCG(iglob,jglob)
          enddo
          enddo
+# else
+         do j = Jbeg,Jend
+         do i = Ibeg,Iend
+           iglob = i-Nghost
+           jglob = j-Nghost
+           Hc(i,j) = HCG(iglob,jglob)
+         enddo
+         enddo
+# endif
        endif
      endif
 
@@ -4970,7 +6053,36 @@
      ! save the initial water depth
      Hc0 = Hc
 
+# if defined (TWOLAYERSLIDE)
+     do j = Jbeg,Jend
+     do i = Ibeg,Iend
+       DepAng(i,j) = (Hc0(i+1,j)-Hc0(i-1,j))/(2.0*dx)
+       DepAng(i,j) = atan(DepAng(i,j))
+       CosAng(i,j) = cos(DepAng(i,j))
+     enddo
+     enddo
+     call phi_2D_coll(DepAng)
+     call phi_2D_coll(CosAng)
+# endif
 
+# if defined (LANDSLIDE)
+     if(trim(SlideType)=='RIGID') then
+       ! for landslide problem, put slide over the bathymetry
+       e = 0.717
+       alpha0 = SlideAngle*pi/180.
+       kb = 2.0*acosh(1.0/e)/SlideL
+       kw = 2.0*acosh(1.0/e)/SlideW
+
+       do j = Jbeg,Jend
+       do i = Ibeg,Iend
+         xt = (xc(i)-SlideX0)*cos(alpha0)+(yc(j)-SlideY0)*sin(alpha0)
+         yt = -(xc(i)-SlideX0)*sin(alpha0)+(yc(j)-SlideY0)*cos(alpha0)
+         zt = SlideT/(1-e)*(1.0/cosh(kb*xt)/cosh(kw*yt)-e)
+         Hc(i,j) = Hc0(i,j)-max(0.0,zt)
+       enddo
+       enddo
+     endif
+# endif
 
      ! find pernament dry cells
      Mask_Struct = 1
@@ -5022,7 +6134,11 @@
      integer :: i,j,k
 
      ! horizontal grid
+# if defined (PARALLEL)
      x(Ibeg) = npx*(Mloc-2*Nghost)*dx
+# else
+     x(Ibeg) = Zero
+# endif
      do i = Ibeg+1,Mloc1
        x(i) = x(i-1)+dx
        xc(i-1) = x(i-1)+0.5*dx
@@ -5032,7 +6148,11 @@
        xc(i) = x(i+1)-0.5*dx
      enddo
 
+# if defined (PARALLEL)
      y(Jbeg) = npy*(Nloc-2*Nghost)*dy
+# else
+     y(Jbeg) = Zero
+# endif
      do j = Jbeg+1,Nloc1
        y(j) = y(j-1)+dy
        yc(j-1) = y(j-1)+0.5*dy
@@ -5099,6 +6219,10 @@
      Screen_Count = Zero
      Plot_Count = Zero
      Plot_Count_Stat = Zero
+# if defined (SEDIMENT)
+     Update_Bed_T = Zero
+     nbed = 0
+# endif
      Icount = 0
      
      ! working arrays
@@ -5251,6 +6375,14 @@
      Euler_Vmean = Zero
      Euler_Wmean = Zero
 
+# if defined (SEDIMENT)
+     Smean = Zero
+     Euler_Smean = Zero
+     Qbedx = Zero
+     Qbedy = Zero
+     QbxAvg = Zero
+     QbyAvg = Zero
+# endif
 
      ExtForceX = Zero
      ExtForceY = Zero
@@ -5259,12 +6391,192 @@
      DRhoX = Zero
      DRhoY = Zero
 
+# if defined (BUBBLE)
+     Nbg = Zero
+     DNbg = Zero
+     DNbg0 = Zero
+     Vbg = Zero
+# endif
 
+# if defined (SEDIMENT)
+     Conc = Zero
+     DConc = Zero
+     DConc0 = Zero
+     Bed = Zero
+     TotDep = Zero
+     Sed_X0 = Zero
+     Sed_Xn = Zero
+# endif
 
+# if defined (SALINITY)
+     Sali = Zero
+     DSali = Zero
+     DSali0 = Zero
+     Sin_X0 = Zero
+     Sin_Xn = Zero
+# endif
 
+# if defined (TEMPERATURE)
+     Temp = 10.
+# endif
 
+# if defined (VEGETATION)
+     FVegH = VegH
+     foliage = one
+# endif
 
+# if defined (OBSTACLE)
+     PresForceX = Zero
+     PresForceY = Zero
+     PresForceZ = Zero
+# endif
 
+# if defined (TWOLAYERSLIDE)
+     Ha0 = Zero
+     Ua0 = Zero
+     Va0 = Zero
+     Ha = Zero
+     Ua = Zero
+     Va = Zero
+     HUa = Zero
+     HVa = Zero
+     HUa0 = Zero
+     HVa0 = Zero
+     HaxL = Zero
+     HaxR = Zero
+     UaxL = Zero
+     UaxR = Zero
+     VaxL = Zero
+     VaxR = Zero
+     HayL = Zero
+     HayR = Zero
+     UayL = Zero
+     UayR = Zero
+     VayL = Zero
+     VayR = Zero
+     HUaxL = Zero
+     HUaxR = Zero
+     HVaxL = Zero
+     HVaxR = Zero
+     HUayL = Zero
+     HUayR = Zero
+     HVayL = Zero
+     HVayR = Zero
+     Eax = Zero
+     Eay = Zero
+     EaxL = Zero
+     EaxR = Zero
+     EayL = Zero
+     EayR = Zero
+     Fax = Zero
+     Fay = Zero
+     FaxL = Zero
+     FaxR = Zero
+     FayL = Zero
+     FayR = Zero
+     Gax = Zero
+     Gay = Zero
+     GaxL = Zero
+     GaxR = Zero
+     GayL = Zero
+     GayR = Zero
+     SaxL = Zero
+     SaxR = Zero
+     SaxS = Zero
+     SayL = Zero
+     SayR = Zero
+     SayS = Zero
+
+     Kap = one
+     DelxKap = Zero
+     DelyKap = Zero
+
+     SorceaX = Zero
+     SorceaY = Zero
+
+     ForceX_UL = Zero
+     ForceY_UL = Zero
+
+     Maska = 1     
+
+     ! specify the landslide
+!     eslide = 0.717
+     alpha0 = SlopeAngle*pi/180.
+!     kb = 2.0*acosh(1.0/eslide)/SlideL
+!     kw = 2.0*acosh(1.0/eslide)/SlideW
+     SlideX1 = SlideX0-0.5*SlideL*cos(alpha0)
+     SlideX2 = SlideX0+0.5*SlideL*cos(alpha0)
+
+     do j = 1,Nloc
+     do i = 1,Mloc
+       if(xc(i)>=SlideX1.and.xc(i)<=SlideX2  &
+          .and.yc(j)>=SlideY0-SlideW/2.0.and.yc(j)<=SlideY0+SlideW/2.0) then
+          zt = SlideT
+       else
+         zt = 0.0
+       endif
+       Ha(i,j) = max(0.0,zt)
+       if(Ha(i,j)-0.001<=1.e-6) then
+         Maska(i,j) = 0
+         Ha(i,j) = 0.001
+       endif
+     enddo
+     enddo
+     Ha0 = Ha
+
+     do j = 1,Nloc
+     do i = 1,Mloc
+       if(Maska(i,j)==1) then
+         Ua(i,j) = SlideIniU
+       endif
+     enddo
+     enddo
+
+     call convert_Ha_to_Hs
+
+     ! update the thinckness of upper layer
+     do j = 1,Nloc
+     do i = 1,Mloc
+       if(Maska(i,j)==1) then
+         Hc(i,j) = Hc0(i,j)-Hs(i,j)
+       else
+         Hc(i,j) = Hc0(i,j)
+       endif
+     enddo
+     enddo
+
+     
+
+     call phi_2D_coll(Ua)
+     Ua0 = Ua
+     HUa = Ha*Ua
+     HUa0 = HUa
+
+     ! reconstruct depth at x-y faces                                                                                          
+     do j = 1,Nloc
+     do i = 2,Mloc
+       Hfx(i,j) = 0.5*(Hc(i-1,j)+Hc(i,j))
+     enddo
+     Hfx(1,j) = Hc(1,j)
+     Hfx(Mloc1,j) = Hc(Mloc,j)
+     enddo
+
+     do i = 1,Mloc
+     do j = 2,Nloc
+       Hfy(i,j) = 0.5*(Hc(i,j-1)+Hc(i,j))
+     enddo
+     Hfy(i,1) = Hc(i,1)
+     Hfy(i,Nloc1) = Hc(i,Nloc)
+     enddo
+
+     ! derivatives of water depth at cell center
+     do j = 1,Nloc
+     do i = 1,Mloc
+       DelxH(i,j) = (Hfx(i+1,j)-Hfx(i,j))/dx
+       DelyH(i,j) = (Hfy(i,j+1)-Hfy(i,j))/dy
+     enddo
+     enddo
+# endif
 
      Tke = Zero
      Eps = Zero
@@ -5310,6 +6622,7 @@
         enddo
         enddo
 
+# if defined (PARALLEL)
        do j = Jbeg,Jend
        do i = Ibeg,Iend
          iglob = npx*(Mloc-2*Nghost)+i-Nghost
@@ -5322,6 +6635,20 @@
          enddo
        enddo
        enddo
+# else
+       do j = Jbeg,Jend
+       do i = Ibeg,Iend
+         iglob = i-Nghost
+         jglob = j-Nghost
+         Eta(i,j) = EtaG(iglob,jglob)
+         do k = Kbeg,Kend
+           U(i,j,k) = UG(iglob,jglob,k-Nghost)
+           V(i,j,k) = VG(iglob,jglob,k-Nghost)
+           W(i,j,k) = WG(iglob,jglob,k-Nghost)
+         enddo
+       enddo
+       enddo
+# endif        
 
 !       ! solitary wave from Tanaka solution
 !       open(21,file='soliton.dat')
@@ -5415,8 +6742,10 @@
      enddo
      Mask = Mask*Mask_Struct
 
+# if defined (PARALLEL)
      ! collect mask into ghost cells
      call phi_int_exch(Mask)
+# endif
 
      do j = Jbeg,Jend
      do i = Ibeg,Iend
@@ -5430,9 +6759,11 @@
      D = max(Hc+Eta, MinDep)
 
      call vel_bc
+# if defined (PARALLEL)
      call phi_3D_exch(U)
      call phi_3D_exch(V)
      call phi_3D_exch(W)
+# endif
 
      do k = 1,Kloc
      do j = 1,Nloc
@@ -5467,7 +6798,179 @@
        enddo
      endif
 
+# if defined (SALINITY)
 
+     ! read initial salinity field from an input file
+     if(INITIAL_SALI) then
+       open(23,file='sali0.txt',status='old')
+       do k = 1,Kglob
+       do j = 1,Nglob
+         read(23,*) (SaliG(i,j,k),i=1,Mglob)
+       enddo
+       enddo
+
+# if defined (PARALLEL)
+       do j = Jbeg,Jend
+       do i = Ibeg,Iend
+         iglob = npx*(Mloc-2*Nghost)+i-Nghost
+         jglob = npy*(Nloc-2*Nghost)+j-Nghost
+         do k = Kbeg,Kend
+           Sali(i,j,k) = SaliG(iglob,jglob,k-Nghost)
+         enddo
+       enddo
+       enddo
+# else
+       do j = Jbeg,Jend
+       do i = Ibeg,Iend
+         iglob = i-Nghost
+         jglob = j-Nghost
+         do k = Kbeg,Kend
+           Sali(i,j,k) = SaliG(iglob,jglob,k-Nghost)
+         enddo
+       enddo
+       enddo
+# endif
+     else
+       do i = Ibeg,Iend
+       do j = Jbeg,Jend
+       do k = Kbeg,Kend
+         Sali(i,j,k) = (1.0-sigc(k))*0.01
+       enddo
+       enddo
+       enddo
+     endif
+
+     ! boundary conditions
+     do j = Jbeg,Jend
+     do k = Kbeg,Kend
+       Sin_X0(j,k) = Sali(Ibeg,j,k)
+       Sin_Xn(j,k) = Sali(Iend,j,k)
+     enddo
+     enddo
+
+     call sali_bc
+# if defined (PARALLEL)
+     call phi_3D_exch(Sali)
+# endif
+
+     do i = 1,Mloc
+     do j = 1,Nloc
+     do k = 1,Kloc
+       DSali(i,j,k) = D(i,j)*Sali(i,j,k)
+     enddo
+     enddo
+     enddo     
+
+     DSali0 = DSali
+
+     call eval_dens
+# endif
+
+# if defined (LANDSLIDE)
+     if(trim(SlideType)=='DEFORMABLE') then
+# if defined (SEDIMENT)
+       SlideAngle = SlideAngle*pi/180.
+       conc_slide = (SlideDens-Rho0)/(SRho-Rho0)
+       ls1 = SlideX0-0.5*SlideL*cos(SlideAngle)
+       ls2 = SlideX0+0.5*SlideL*cos(SlideAngle)
+
+       do i = Ibeg,Iend
+       do j = Jbeg,Jend
+         lsx = (xc(i)-SlideX0)/cos(SlideAngle)
+         if(xc(i)>=ls1.and.xc(i)<=ls2) then
+           hslide = SlideT*(1.0-(2.0*lsx/SlideL)**2)
+           ! The following slide height is an approximation.
+           Zslide(i,j) = hslide/cos(SlideAngle)
+         else
+           Zslide(i,j) = 0.0
+         endif
+
+         do k = Kbeg,Kend
+            Zlev = sigc(k)*Hc(i,j)
+            if(Zlev<=Zslide(i,j)) then
+              Conc(i,j,k) = conc_slide
+            else
+              Conc(i,j,k) = 0.0
+            endif
+            DConc(i,j,k) = D(i,j)*Conc(i,j,k)
+         enddo
+       enddo
+       enddo
+
+!       ! lab case
+!       do i = Ibeg,Iend
+!       do j = Jbeg,Jend
+!         if(xc(i)>=1.0.and.xc(i)<=1.65) then
+!           Zslide(i,j) = xc(i)-1.0
+!         else
+!           Zslide(i,j) = 0.0
+!         endif
+!
+!         do k = Kbeg,Kend
+!            Zlev = sigc(k)*Hc(i,j)
+!            if(xc(i)>=1.0.and.xc(i)<=1.65) then
+!              if(Zlev<=Zslide(i,j)) then
+!                Conc(i,j,k) = conc_slide
+!              else
+!                Conc(i,j,k) = 0.0
+!              endif
+!            endif
+!            DConc(i,j,k) = D(i,j)*Conc(i,j,k)
+!         enddo
+!       enddo
+!     enddo
+
+       call sedi_bc
+# if defined (PARALLEL)
+       call phi_3D_exch(DConc)
+# endif
+
+       DConc0 = DConc
+
+       do i = 1,Mloc
+       do j = 1,Nloc
+       do k = 1,Kloc
+         Conc(i,j,k) = DConc(i,j,k)/D(i,j)
+       enddo
+       enddo
+       enddo
+
+       ! update mixture density
+       call eval_dens
+
+       ! update mixture viscosity
+       do i = 1,Mloc
+       do j = 1,Nloc
+       do k = 1,Kloc
+         if(Conc(i,j,k)<0.1) then
+           Cmu(i,j,k) = Visc
+         else
+           Cmu(i,j,k) = Mud_Visc
+         endif
+       enddo
+       enddo
+       enddo
+
+       ! rheology
+       IsMove = 1
+       if(RHEOLOGY_ON) then
+         do i = 1,Mloc
+         do j = 1,Nloc
+         do k = 1,Kloc
+           if(Conc(i,j,k)>=0.1) then
+             CmuR(i,j,k) = 1.e+10
+             IsMove(i,j,k) = 0
+           else
+             CmuR(i,j,k) = 0.0
+             IsMove(i,j,k) = 1
+           endif
+         enddo
+         enddo
+         enddo
+       endif
+# endif
+     endif
+# endif
 
      ! SSP Runge-Kutta method parameters
      if(TIME_ORDER(1:3)=='THI') then
@@ -5566,13 +7069,62 @@
               DelxDU(Mloc,Nloc,Kloc),DelyDU(Mloc,Nloc,Kloc),DelxDV(Mloc,Nloc,Kloc),DelyDV(Mloc,Nloc,Kloc), &
               DelxDW(Mloc,Nloc,Kloc),DelyDW(Mloc,Nloc,Kloc),DelzO(Mloc,Nloc,Kloc)) 
 
+# if defined (BUBBLE)
+     ALLOCATE(Rbg(Mg),DRbg(Mg),Wbg(Mg),Entrain(Mg))
+     ALLOCATE(Nbg(Mloc,Nloc,Kloc,Mg),DNbg(Mloc,Nloc,Kloc,Mg),DNbg0(Mloc,Nloc,Kloc,Mg),Vbg(Mloc,Nloc,Kloc))
+# endif
 
+# if defined (SEDIMENT)
+     ALLOCATE(Conc(Mloc,Nloc,Kloc),DConc(Mloc,Nloc,Kloc),DConc0(Mloc,Nloc,Kloc),  &
+              Euler_Smean(Mloc,Nloc,Kloc),Smean(Mloc,Nloc),Qbedx(Mloc,Nloc),Qbedy(Mloc,Nloc),  &
+              SSour(Mloc,Nloc),Bed(Mloc,Nloc),Bed0(Mloc,Nloc),Taub(Mloc,Nloc),Sed_X0(Nloc,Kloc),  &
+              Sed_Xn(Nloc,Kloc),QbxAvg(Mloc,Nloc),QbyAvg(Mloc,Nloc),TotDep(Mloc,Nloc))
+# endif
 
+# if defined (SALINITY)
+     ALLOCATE(Sali(Mloc,Nloc,Kloc),DSali(Mloc,Nloc,Kloc),DSali0(Mloc,Nloc,Kloc))
+     ALLOCATE(Sin_X0(Nloc,Kloc),Sin_Xn(Nloc,Kloc))
+# endif
 
+# if defined (TEMPERATURE)
+     ALLOCATE(Temp(Mloc,Nloc,Kloc),DTemp(Mloc,Nloc,Kloc),DTemp0(Mloc,Nloc,Kloc))                                    
+     ALLOCATE(Tin_X0(Nloc,Kloc),Tin_Xn(Nloc,Kloc))
+# endif
 
+# if defined (VEGETATION)
+     ALLOCATE(Prod_v(Mloc,Nloc,Kloc),FVegH(Mloc,Nloc),foliage(Mloc,Nloc))
+# endif
 
+# if defined (BALANCE2D)
+     ALLOCATE(DUDT2D(Mloc,Nloc),DVDT2D(Mloc,Nloc),DEDX2D(Mloc,Nloc),DEDY2D(Mloc,Nloc),  &
+              DPDX2D(Mloc,Nloc),DPDY2D(Mloc,Nloc),DIFFX2D(Mloc,Nloc),DIFFY2D(Mloc,Nloc),  &
+              TAUBX2D(Mloc,Nloc),TAUBY2D(Mloc,NLoc),FVEGX2D(Mloc,Nloc),FVEGY2D(Mloc,Nloc))
+# endif
 
+# if defined (OBSTACLE)
+     ALLOCATE(set_flag(Mloc,Nloc,Kloc),ObsForceX(Mloc,Nloc,Kloc),ObsForceY(Mloc,Nloc,Kloc), &
+              ObsForceZ(Mloc,Nloc,Kloc),set_dist_x(Mloc,Nloc,Kloc),set_dist_y(Mloc,Nloc,Kloc), &
+              set_dist_z(Mloc,Nloc,Kloc))
+# endif
 
+# if defined (TWOLAYERSLIDE)
+     ALLOCATE(Ha(Mloc,Nloc),Hs(Mloc,Nloc),Ha0(Mloc,Nloc),Ua(Mloc,Nloc),Ua0(Mloc,Nloc),Va(Mloc,Nloc),Va0(Mloc,Nloc), &
+              HUa0(Mloc,Nloc),HVa0(Mloc,Nloc),HUa(Mloc,Nloc),HVa(Mloc,Nloc),Maska(Mloc,Nloc),  &
+              SorceaX(Mloc,Nloc),SorceaY(Mloc,Nloc),DelxHa(Mloc,Nloc),DelxUa(Mloc,Nloc),DelxVa(Mloc,Nloc), &
+              DelxHUa(Mloc,Nloc),DelxHVa(Mloc,Nloc),DelyHa(Mloc,Nloc),DelyUa(Mloc,Nloc),DelyVa(Mloc,Nloc), &
+              DelyHUa(Mloc,Nloc),DelyHVa(Mloc,Nloc),DepAng(Mloc,Nloc),CosAng(Mloc,Nloc),ForceX_UL(Mloc,NLoc), &
+              ForceY_UL(Mloc,Nloc))
+
+     ALLOCATE(HaxL(Mloc1,Nloc),HaxR(Mloc1,Nloc),UaxL(Mloc1,Nloc),UaxR(Mloc1,Nloc),VaxL(Mloc1,Nloc),VaxR(Mloc1,Nloc), &
+              HayL(Mloc,Nloc1),HayR(Mloc,Nloc1),UayL(Mloc,Nloc1),UayR(Mloc,Nloc1),VayL(Mloc,Nloc1),VayR(Mloc,Nloc1), &
+              HUaxL(Mloc1,Nloc),HUaxR(Mloc1,Nloc),HVaxL(Mloc1,Nloc),HVaxR(Mloc1,Nloc),HUayL(Mloc,Nloc1), &
+              HUayR(Mloc,Nloc1),HVayL(Mloc,Nloc1),HVayR(Mloc,Nloc1),Eax(Mloc1,Nloc),Eay(Mloc,Nloc1),EaxL(Mloc1,Nloc),  &
+              EaxR(Mloc1,Nloc),EayL(Mloc,Nloc1),EayR(Mloc,Nloc1),Fax(Mloc1,Nloc),FaxL(Mloc1,Nloc),FaxR(Mloc1,Nloc), &
+              Fay(Mloc,Nloc1),FayL(Mloc,Nloc1),FayR(Mloc,Nloc1),Gax(Mloc1,Nloc),GaxL(Mloc1,Nloc),GaxR(Mloc1,Nloc), &
+              Gay(Mloc,Nloc1),GayL(Mloc,Nloc1),GayR(Mloc,Nloc1),Kap(Mloc,Nloc),KapxL(Mloc1,Nloc),KapxR(Mloc1,Nloc), &
+              KapyL(Mloc,Nloc1),KapyR(Mloc,Nloc1),DelxKap(Mloc,Nloc),DelyKap(Mloc,Nloc),SaxL(Mloc1,Nloc), &
+              SaxR(Mloc1,Nloc),SaxS(Mloc1,Nloc),SayL(Mloc,Nloc1),SayR(Mloc,Nloc1),SayS(Mloc,Nloc1))
+# endif
 
      ! poisson solver (for NSPCG use)
      neqns = (Iend-Ibeg+1)*(Jend-Jbeg+1)*(Kend-Kbeg+1)
@@ -5591,6 +7143,7 @@
      use global
      implicit none
 
+# if defined (PARALLEL)
      dims(1)=PX
      dims(2)=PY
      periods(1)=.false.
@@ -5609,6 +7162,10 @@
  
      call MPI_CART_SHIFT(comm2d,0,1,n_west,n_east,ier)
      call MPI_CART_SHIFT(comm2d,1,1,n_suth,n_nrth,ier)
+# else
+     PX=1
+     PY=1
+# endif
 
      ! local index
      Mloc = Mglob/PX+2*Nghost
@@ -5640,6 +7197,9 @@
 !---------------------------------------------------
      use global
      use input_util
+# if defined (INTEL)
+!     use IFPORT, only: rand
+# endif
      implicit none
      character(len=80) :: FILE_NAME
      real(SP) :: Segma,Celerity,Wave_Length,Wave_Number,  &
@@ -5656,21 +7216,38 @@
      ! title
      CALL GET_STRING_VAL(TITLE,FILE_NAME,'TITLE',line,ierr)
      IF(ierr==1)THEN
+# if defined (PARALLEL)
        if(myid.eq.0) write(3,*) 'No TITLE in ', FILE_NAME, 'use default'
+# else
+       write(3,*) 'No TITLE in ', FILE_NAME, 'use default'
+# endif
        TITLE='---TEST RUN---'
      ENDIF
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,*)'---- LOG FILE ---'
      if(myid.eq.0) WRITE(3,*)TITLE
      if(myid.eq.0) WRITE(3,*)'--------------input start --------------'
+# else
+     WRITE(3,*)'---- LOG FILE ---'
+     WRITE(3,*)TITLE
+     WRITE(3,*)'--------------input start --------------'
+# endif
 
      ! dimension                                             
      CALL GET_INTEGER_VAL(Mglob,FILE_NAME,'Mglob',line)
      CALL GET_INTEGER_VAL(Nglob,FILE_NAME,'Nglob',line)
      CALL GET_INTEGER_VAL(Kglob,FILE_NAME,'Kglob',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A7,I5)')'Mglob= ',Mglob
      if(myid.eq.0) WRITE(3,'(A7,I5)')'Nglob= ',Nglob
      if(myid.eq.0) WRITE(3,'(A7,I5)')'Kglob= ',Kglob
+# else
+     WRITE(3,'(A7,I5)')'Mglob= ',Mglob
+     WRITE(3,'(A7,I5)')'Nglob= ',Nglob
+     WRITE(3,'(A7,I5)')'Kglob= ',Kglob
+# endif
 
+# if defined (PARALLEL)
      ! processor number
      CALL GET_INTEGER_VAL(PX,FILE_NAME,'PX',line)
      CALL GET_INTEGER_VAL(PY,FILE_NAME,'PY',line)
@@ -5680,30 +7257,51 @@
        if(myid.eq.0) WRITE(3,'(A6,I5)') 'NumP= ',NumP
        stop
      endif
+# endif
 
      ! grid sizes
      CALL GET_Float_VAL(dx,FILE_NAME,'DX',line)
      CALL GET_Float_VAL(dy,FILE_NAME,'DY',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A4,F8.4)')'DX= ',dx
      if(myid.eq.0) WRITE(3,'(A4,F8.4)')'DY= ',dy
+# else
+     WRITE(3,'(A4,F8.4)')'DX= ',dx
+     WRITE(3,'(A4,F8.4)')'DY= ',dy
+# endif
 
      ! vertical grid option
      call GET_INTEGER_VAL(Ivgrd,FILE_NAME,'IVGRD',line)
      CALL GET_Float_VAL(Grd_R,FILE_NAME,'GRD_R',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A7,I3)')'Ivgrd= ',Ivgrd
      if(myid.eq.0) WRITE(3,'(A7,f5.2)')'Grd_R= ',Grd_R
+# else
+     WRITE(3,'(A7,I3)')'Ivgrd= ',Ivgrd
+     WRITE(3,'(A7,f5.2)')'Grd_R= ',Grd_R
+# endif
 
      ! time step
      CALL GET_Float_VAL(dt_ini,FILE_NAME,'DT_INI',line)
      CALL GET_Float_VAL(dt_min,FILE_NAME,'DT_MIN',line)
      CALL GET_Float_VAL(dt_max,FILE_NAME,'DT_MAX',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A8,F8.4)')'DT_INI= ',dt_ini
      if(myid.eq.0) WRITE(3,'(A8,F8.4)')'DT_MIN= ',dt_min
      if(myid.eq.0) WRITE(3,'(A8,F8.4)')'DT_MAX= ',dt_max
+# else
+     WRITE(3,'(A8,F8.4)')'DT_INI= ',dt_ini
+     WRITE(3,'(A8,F8.4)')'DT_MIN= ',dt_min
+     WRITE(3,'(A8,F8.4)')'DT_MAX= ',dt_max
+# endif
 
      ! result folder                                     
      CALL GET_STRING_VAL(RESULT_FOLDER,FILE_NAME,'RESULT_FOLDER',line,ierr)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A15,A50)')'RESULT_FOLDER= ', RESULT_FOLDER
+# else
+     WRITE(3,'(A15,A50)')'RESULT_FOLDER= ', RESULT_FOLDER
+# endif
 
      ! simulation steps and time
      call GET_INTEGER_VAL(SIM_STEPS,FILE_NAME,'SIM_STEPS',line)
@@ -5711,23 +7309,43 @@
      CALL GET_Float_VAL(Plot_Start,FILE_NAME,'PLOT_START',line)
      CALL GET_Float_VAL(Plot_Intv,FILE_NAME,'PLOT_INTV',line)
      CALL GET_Float_VAL(Screen_Intv,FILE_NAME,'SCREEN_INTV',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A11,I12)')'SIM_STEPS= ', SIM_STEPS
      if(myid.eq.0) WRITE(3,'(A12,F8.2)')'TOTAL_TIME= ', TOTAL_TIME
      if(myid.eq.0) WRITE(3,'(A11,F8.2)')'PLOT_START= ', Plot_Start
      if(myid.eq.0) WRITE(3,'(A11,F8.2)')'PLOT_INTV= ', Plot_Intv
      if(myid.eq.0) WRITE(3,'(A13,F8.2)')'SCREEN_INTV= ', Screen_Intv
+# else
+     WRITE(3,'(A11,I12)')'SIM_STEPS= ', SIM_STEPS
+     WRITE(3,'(A12,F8.2)')'TOTAL_TIME= ', TOTAL_TIME
+     WRITE(3,'(A11,F8.2)')'PLOT_START= ', Plot_Start
+     WRITE(3,'(A11,F8.2)')'PLOT_INTV= ', Plot_Intv
+     WRITE(3,'(A13,F8.2)')'SCREEN_INTV= ', Screen_Intv
+# endif
 
      ! courant number
      CALL GET_Float_VAL(CFL,FILE_NAME,'CFL',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A5,F8.3)')'CFL= ',CFL
+# else
+     WRITE(3,'(A5,F8.3)')'CFL= ',CFL
+# endif
 
      ! viscous number
      CALL GET_Float_VAL(VISCOUS_NUMBER,FILE_NAME,'VISCOUS_NUMBER',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A16,F8.3)')'VISCOUS_NUMBER= ',VISCOUS_NUMBER
+# else
+     WRITE(3,'(A16,F8.3)')'VISCOUS_NUMBER= ',VISCOUS_NUMBER
+# endif
 
      ! minimum depth
      CALL GET_Float_VAL(MinDep,FILE_NAME,'MinDep',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A8,F8.3)')'MinDep= ',MinDep
+# else
+     WRITE(3,'(A8,F8.3)')'MinDep= ',MinDep
+# endif
 
      ! laminar viscosity
      CALL GET_LOGICAL_VAL(VISCOUS_FLOW,FILE_NAME,'VISCOUS_FLOW',line)
@@ -5737,6 +7355,7 @@
      CALL GET_Float_VAL(Schmidt,FILE_NAME,'Schmidt',line)
      CALL GET_Float_VAL(Cvs,FILE_NAME,'Cvs',line)
      CALL GET_Float_VAL(Chs,FILE_NAME,'Chs',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A14,L4)')'VISCOUS_FLOW= ',VISCOUS_FLOW
      if(myid.eq.0) WRITE(3,'(A8,I2)')'IVTURB= ',IVturb
      if(myid.eq.0) WRITE(3,'(A8,I2)')'IHTURB= ',IHturb
@@ -5744,25 +7363,52 @@
      if(myid.eq.0) WRITE(3,'(A9,F8.3)')'Schmidt= ',Schmidt
      if(myid.eq.0) WRITE(3,'(A6,F8.3)')'Cvs= ',Cvs
      if(myid.eq.0) WRITE(3,'(A6,F8.3)')'Chs= ',Chs
+# else
+     WRITE(3,'(A14,L4)')'VISCOUS_FLOW= ',VISCOUS_FLOW
+     WRITE(3,'(A7,I2)')'IVTURB= ',IVturb
+     WRITE(3,'(A7,I2)')'IHTURB= ',IHturb
+     WRITE(3,'(A11,F8.3)')'VISCOSITY= ',Visc
+     WRITE(3,'(A9,F8.3)')'Schmidt= ',Schmidt
+     WRITE(3,'(A6,F8.3)')'Cvs= ',Cvs
+     WRITE(3,'(A6,F8.3)')'Chs= ',Chs
+# endif
 
      ! bathymetry     
      CALL GET_STRING_VAL(DEPTH_TYPE,FILE_NAME,'DEPTH_TYPE',line,ierr)
      CALL GET_LOGICAL_VAL(ANA_BATHY,FILE_NAME,'ANA_BATHY',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A12,A50)')'DEPTH_TYPE= ',DEPTH_TYPE
      if(myid.eq.0) WRITE(3,'(A11,L4)')'ANA_BATHY= ',ANA_BATHY
+# else
+     WRITE(3,'(A12,A50)')'DEPTH_TYPE= ',DEPTH_TYPE
+     WRITE(3,'(A11,L4)')'ANA_BATHY= ',ANA_BATHY
+# endif
 
      ! initial conditions
      CALL GET_LOGICAL_VAL(INITIAL_EUVW,FILE_NAME,'INITIAL_EUVW',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A14,L4)')'INITIAL_EUVW= ',INITIAL_EUVW
+# else
+     WRITE(3,'(A14,L4)')'INITIAL_EUVW= ',INITIAL_EUVW
+# endif
 
      ! bottom roughness
      CALL GET_INTEGER_VAL(Ibot,FILE_NAME,'Ibot',line)
      CALL GET_Float_VAL(Cd0,FILE_NAME,'Cd0',line)
      CALL GET_Float_VAL(Zob,FILE_NAME,'Zob',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A6,I2)')'Ibot= ',Ibot
      if(myid.eq.0) WRITE(3,'(A5,F8.5)')'Cd0= ',Cd0
      if(myid.eq.0) WRITE(3,'(A5,F8.5)')'Zob= ',Zob
+# else
+     WRITE(3,'(A6,I2)')'Ibot= ',Ibot
+     WRITE(3,'(A5,F8.5)')'Cd0= ',Cd0
+     WRITE(3,'(A5,F8.5)')'Zob= ',Zob
+# endif
 
+# if defined (CORALREEF)
+     CALL GET_Float_VAL(Creef,FILE_NAME,'Creef',line)
+# endif
 
      ! wind speed/stress
      CALL GET_INTEGER_VAL(Iws,FILE_NAME,'Iws',line)
@@ -5779,7 +7425,11 @@
 
      ! barotropic or baroclinic
      CALL GET_LOGICAL_VAL(BAROTROPIC,FILE_NAME,'BAROTROPIC',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A12,L4)')'BAROTROPIC= ',BAROTROPIC
+# else
+     WRITE(3,'(A12,L4)')'BAROTROPIC= ',BAROTROPIC
+# endif
 
      ! numerical scheme
      CALL GET_STRING_VAL(HIGH_ORDER,FILE_NAME,'HIGH_ORDER',line,ierr)
@@ -5787,37 +7437,72 @@
      CALL GET_STRING_VAL(CONVECTION,FILE_NAME,'CONVECTION',line,ierr)
      CALL GET_LOGICAL_VAL(ADV_HLLC,FILE_NAME,'HLLC',line)
      IF(ierr==1)THEN
+# if defined (PARALLEL)
        if(myid.eq.0) WRITE(3,'(A12,A50)')'HIGH_ORDER', 'NOT DEFINED, USE DEFAULT'
+# else
+       WRITE(3,'(A12,A50)')'HIGH_ORDER', 'NOT DEFINED, USE DEFAULT'
+# endif
        HIGH_ORDER='SECOND'
      ENDIF
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A12,A50)')'HIGH_ORDER= ', HIGH_ORDER
+# else
+     WRITE(3,'(A12,A50)')'HIGH_ORDER= ', HIGH_ORDER
+# endif
      IF(ierr==1)THEN
+# if defined (PARALLEL)
        if(myid.eq.0) WRITE(3,'(A12,A50)')'TIME_ORDER', 'NOT DEFINED, USE DEFAULT'
+# else
+       WRITE(3,'(A12,A50)')'TIME_ORDER', 'NOT DEFINED, USE DEFAULT'
+# endif
        TIME_ORDER='THIRD'
      ENDIF
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A12,A50)')'TIME_ORDER= ', TIME_ORDER
+# else
+     WRITE(3,'(A12,A50)')'TIME_ORDER= ', TIME_ORDER
+# endif
 
      ! ramp up the simulation
      CALL GET_Float_VAL(TRamp,FILE_NAME,'TRAMP',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A7,E12.3)')'TRAMP= ',TRamp
+# else
+     WRITE(3,'(A7,E12.3)')'TRAMP= ',TRamp
+# endif
 
      ! if non-hydrostatic simulation
      CALL GET_LOGICAL_VAL(NON_HYDRO,FILE_NAME,'NON_HYDRO',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A11,L4)')'NON_HYDRO= ',NON_HYDRO
+# else
+     WRITE(3,'(A11,L4)')'NON_HYDRO= ',NON_HYDRO
+# endif
 
      ! poisson solver
      CALL GET_INTEGER_VAL(isolver,FILE_NAME,'ISOLVER',line)
      CALL GET_INTEGER_VAL(itmax,FILE_NAME,'ITMAX',line)
      CALL GET_Float_VAL(tol,FILE_NAME,'TOL',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A9,I2)')'ISOLVER= ',isolver
      if(myid.eq.0) WRITE(3,'(A7,I5)')'ITMAX= ',itmax
      if(myid.eq.0) WRITE(3,'(A5,E12.3)')'TOL= ',tol
+# else
+     WRITE(3,'(A9,I2)')'ISOLVER= ',isolver
+     WRITE(3,'(A7,I5)')'ITMAX= ',itmax
+     WRITE(3,'(A5,E12.3)')'TOL= ',tol
+# endif
 
      ! periodic bc
      CALL GET_LOGICAL_VAL(PERIODIC_X,FILE_NAME,'PERIODIC_X',line)
      CALL GET_LOGICAL_VAL(PERIODIC_Y,FILE_NAME,'PERIODIC_Y',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A12,L4)')'PERIODIC_X= ',PERIODIC_X
      if(myid.eq.0) WRITE(3,'(A12,L4)')'PERIODIC_Y= ',PERIODIC_Y
+# else
+     WRITE(3,'(A12,L4)')'PERIODIC_X= ',PERIODIC_X
+     WRITE(3,'(A12,L4)')'PERIODIC_Y= ',PERIODIC_Y
+# endif
 
      ! boundary type
      CALL GET_INTEGER_VAL(Bc_X0,FILE_NAME,'BC_X0',line)
@@ -5826,36 +7511,63 @@
      CALL GET_INTEGER_VAL(Bc_Yn,FILE_NAME,'BC_Yn',line)
      CALL GET_INTEGER_VAL(Bc_Z0,FILE_NAME,'BC_Z0',line)
      CALL GET_INTEGER_VAL(Bc_Zn,FILE_NAME,'BC_Zn',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A7,I2)')'BC_X0= ',Bc_X0
      if(myid.eq.0) WRITE(3,'(A7,I2)')'BC_Xn= ',Bc_Xn
      if(myid.eq.0) WRITE(3,'(A7,I2)')'BC_Y0= ',Bc_Y0
      if(myid.eq.0) WRITE(3,'(A7,I2)')'BC_Yn= ',Bc_Yn
      if(myid.eq.0) WRITE(3,'(A7,I2)')'BC_Z0= ',Bc_Z0
      if(myid.eq.0) WRITE(3,'(A7,I2)')'BC_Zn= ',Bc_Zn
+# else
+     WRITE(3,'(A7,I2)')'BC_X0= ',Bc_X0
+     WRITE(3,'(A7,I2)')'BC_Xn= ',Bc_Xn
+     WRITE(3,'(A7,I2)')'BC_Y0= ',Bc_Y0
+     WRITE(3,'(A7,I2)')'BC_Yn= ',Bc_Yn
+     WRITE(3,'(A7,I2)')'BC_Z0= ',Bc_Z0
+     WRITE(3,'(A7,I2)')'BC_Zn= ',Bc_Zn
+# endif
 
      ! wavemaker 
      CALL GET_STRING_VAL(WaveMaker,FILE_NAME,'WAVEMAKER',line,ierr)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A11,A50)')'WAVEMAKER= ', WAVEMAKER
+# else
+     WRITE(3,'(A11,A50)')'WAVEMAKER= ', WAVEMAKER
+# endif
      IF(WaveMaker(1:3)=='LEF'.or.WaveMaker(1:3)=='RIG'  &
          .or.WaveMaker(1:3)=='INT'.or.WaveMaker(1:3)=='FLU')THEN
        CALL GET_Float_VAL(Amp_Wave,FILE_NAME,'AMP',line)
        CALL GET_Float_VAL(Per_Wave,FILE_NAME,'PER',line)
        CALL GET_Float_VAL(Dep_Wave,FILE_NAME,'DEP',line)
        CALL GET_Float_VAL(Theta_Wave,FILE_NAME,'THETA',line)
+# if defined (PARALLEL)
        if(myid.eq.0) WRITE(3,'(A9,F6.3)')'AMP_WAVE= ', Amp_Wave
        if(myid.eq.0) WRITE(3,'(A9,F6.3)')'PER_WAVE= ', Per_Wave
        if(myid.eq.0) WRITE(3,'(A9,F6.3)')'DEP_WAVE= ', Dep_Wave
        if(myid.eq.0) WRITE(3,'(A12,F6.3)')'THETA_WAVE= ', Theta_Wave
+# else
+       WRITE(3,'(A9,F6.3)')'AMP_WAVE= ', Amp_Wave
+       WRITE(3,'(A9,F6.3)')'PER_WAVE= ', Per_Wave
+       WRITE(3,'(A9,F6.3)')'DEP_WAVE= ', Dep_Wave
+       WRITE(3,'(A12,F6.3)')'THETA_WAVE= ', Theta_Wave
+# endif
 
        IF(WaveMaker(1:3)=='INT') then
          CALL GET_Float_VAL(Xsource_West,FILE_NAME,'Xsource_West',line)
          CALL GET_Float_VAL(Xsource_East,FILE_NAME,'Xsource_East',line)
          CALL GET_Float_VAL(Ysource_Suth,FILE_NAME,'Ysource_Suth',line)
          CALL GET_Float_VAL(Ysource_Nrth,FILE_NAME,'Ysource_Nrth',line)
+# if defined (PARALLEL)
          if(myid.eq.0) WRITE(3,'(A14,F6.3)')'Xsource_West= ',Xsource_West
          if(myid.eq.0) WRITE(3,'(A14,F6.3)')'Xsource_East= ',Xsource_East
          if(myid.eq.0) WRITE(3,'(A14,F6.3)')'Ysource_Suth= ',Ysource_Suth
          if(myid.eq.0) WRITE(3,'(A14,F6.3)')'Ysource_Nrth= ',Ysource_Nrth
+# else
+         WRITE(3,'(A14,F6.3)')'Xsource_West= ',Xsource_West                                                                                    
+         WRITE(3,'(A14,F6.3)')'Xsource_East= ',Xsource_East                                                                                    
+         WRITE(3,'(A14,F6.3)')'Ysource_Suth= ',Ysource_Suth                                                                                    
+         WRITE(3,'(A14,F6.3)')'Ysource_Nrth= ',Ysource_Nrth
+# endif
        ENDIF
 
        ! test periodicity
@@ -5906,10 +7618,15 @@
            enddo
          endif
 
+# if defined (PARALLEL)
          if(myid.eq.0) then
            write(3,'(A20,F6.3)') 'Wave angle you set= ',Theta_Wave         
            write(3,'(A28,F6.3)') 'Wave angle for periodic bc= ',Theta_Calc
          endif
+# else
+         write(3,'(A20,F6.3)') 'Wave angle you set= ',Theta_Wave                                                      
+         write(3,'(A28,F6.3)') 'Wave angle for periodic bc= ',Theta_Calc
+# endif
          Theta_Wave = Theta_Calc
        ENDIF
      ENDIF
@@ -5919,16 +7636,26 @@
        open(14,file='spc2d.txt')
        read(14,*) NumFreq,NumDir
        if(NumFreq>MaxNumFreq) then
+# if defined (PARALLEL)
          if(myid.eq.0) then
            write(3,'(A)') 'Please set a larger MaxNumFreq in mod_glob.F'
            stop
          endif
+# else
+         write(3,'(A)') 'Please set a larger MaxNumFreq in mod_glob.F'
+         stop
+# endif
        endif
        if(NumDir>MaxNumDir) then
+# if defined (PARALLEL)
          if(myid.eq.0) then
            write(3,'(A)') 'Please set a larger MaxNumDir in mod_glob.F'
            stop
          endif
+# else
+         write(3,'(A)') 'Please set a larger MaxNumDir in mod_glob.F'
+         stop
+# endif
        endif
        do i = 1,NumFreq
          read(14,*) Freq(i)
@@ -5946,7 +7673,11 @@
        ! random phase for each component
        do j = 1,NumFreq
        do i = 1,NumDir
+# if defined (INTEL)
+         Random_Phs(i,j) = rand()*2.0*pi
+# else
          Random_Phs(i,j) = rand(0)*2.0*pi
+# endif
        enddo
        enddo
      ENDIF
@@ -5958,11 +7689,13 @@
        CALL GET_Float_VAL(Freq_Min,FILE_NAME,'Freq_Min',line)
        CALL GET_Float_VAL(Freq_Max,FILE_NAME,'Freq_Max',line)
        CALL GET_INTEGER_VAL(NumFreq,FILE_NAME,'NumFreq',line) 
+# if defined (PARALLEL)
        if(myid.eq.0) WRITE(3,'(A5,f6.2)')'Hm0= ', Hm0
        if(myid.eq.0) WRITE(3,'(A4,f6.2)')'Tp= ', Tp
        if(myid.eq.0) WRITE(3,'(A10,f6.2)')'Freq_Min= ', Freq_Min
        if(myid.eq.0) WRITE(3,'(A10,f6.2)')'Freq_Max= ', Freq_Max
        if(myid.eq.0) WRITE(3,'(A9,I5)')'NumFreq= ', NumFreq
+# endif
 
        ! jonswap spectrum
        gam = 3.3; sa = 0.07; sb = 0.09
@@ -6017,16 +7750,27 @@
 
      ! sponge layer
      CALL GET_LOGICAL_VAL(SPONGE_ON,FILE_NAME,'SPONGE_ON',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A11,L4)')'SPONGE_ON= ', SPONGE_ON
+# else
+     WRITE(3,'(A11,L4)')'SPONGE_ON= ', SPONGE_ON
+# endif
      IF(SPONGE_ON)THEN
        CALL GET_Float_VAL(Sponge_West_Width,FILE_NAME,'Sponge_West_Width',line)
        CALL GET_Float_VAL(Sponge_East_Width,FILE_NAME,'Sponge_East_Width',line)
        CALL GET_Float_VAL(Sponge_South_Width,FILE_NAME,'Sponge_South_Width',line)
        CALL GET_Float_VAL(Sponge_North_Width,FILE_NAME,'Sponge_North_Width',line)
+# if defined (PARALLEL)
        if(myid.eq.0) WRITE(3,'(A19,F6.3)')'Sponge_West_Width= ', Sponge_West_Width
        if(myid.eq.0) WRITE(3,'(A19,F6.3)')'Sponge_East_Width= ', Sponge_East_Width
        if(myid.eq.0) WRITE(3,'(A20,F6.3)')'Sponge_South_Width= ', Sponge_South_Width
        if(myid.eq.0) WRITE(3,'(A20,F6.3)')'Sponge_North_Width= ', Sponge_North_Width
+# else
+       WRITE(3,'(A19,F6.3)')'Sponge_West_Width= ', Sponge_West_Width
+       WRITE(3,'(A19,F6.3)')'Sponge_East_Width= ', Sponge_East_Width
+       WRITE(3,'(A20,F6.3)')'Sponge_South_Width= ', Sponge_South_Width
+       WRITE(3,'(A20,F6.3)')'Sponge_North_Width= ', Sponge_North_Width
+# endif
      ENDIF
 
      ! wave average control
@@ -6035,10 +7779,85 @@
      CALL GET_Float_VAL(Wave_Ave_End,FILE_NAME,'WAVE_AVERAGE_END',line)
      CALL GET_INTEGER_VAL(WaveheightID,FILE_NAME,'WaveheightID',line)
 
+# if defined (SALINITY)
+     CALL GET_LOGICAL_VAL(INITIAL_SALI,FILE_NAME,'INITIAL_SALI',line)
+# endif
 
+# if defined (SEDIMENT)
+     ! sediment parameters
+     CALL GET_STRING_VAL(Sed_Type,FILE_NAME,'Sed_Type',line,ierr)
+     CALL GET_LOGICAL_VAL(BED_LOAD,FILE_NAME,'BED_LOAD',line)
+     CALL GET_LOGICAL_VAL(COUPLE_FS,FILE_NAME,'COUPLE_FS',line) 
+     CALL GET_INTEGER_VAL(ntyws,FILE_NAME,'ntyws',line)
+     CALL GET_Float_VAL(Sedi_Ws,FILE_NAME,'Sedi_Ws',line)
+     CALL GET_Float_VAL(SD50,FILE_NAME,'D50',line)
+     CALL GET_Float_VAL(Shields_c,FILE_NAME,'Shields_c',line)
+     CALL GET_Float_VAL(Af,FILE_NAME,'Af',line)
+     CALL GET_Float_VAL(Tau_ce,FILE_NAME,'Tau_ce',line)
+     CALL GET_Float_VAL(Tau_cd,FILE_NAME,'Tau_cd',line)
+     CALL GET_Float_VAL(Erate,FILE_NAME,'Erate',line)
+     CALL GET_Float_VAL(Mud_Visc,FILE_NAME,'Mud_Visc',line)
+     CALL GET_Float_VAL(Tim_Sedi,FILE_NAME,'Tim_Sedi',line)
+     CALL GET_Float_VAL(MorDt,FILE_NAME,'MorDt',line)
+     CALL GET_LOGICAL_VAL(BED_CHANGE,FILE_NAME,'BED_CHANGE',line)
+# endif
 
+# if defined (VEGETATION)
+     ! vegetation parameters
+     CALL GET_STRING_VAL(Veg_Type,FILE_NAME,'Veg_Type',line,ierr)
+     CALL GET_Float_VAL(Veg_X0,FILE_NAME,'Veg_X0',line)
+     CALL GET_Float_VAL(Veg_Xn,FILE_NAME,'Veg_Xn',line)
+     CALL GET_Float_VAL(Veg_Y0,FILE_NAME,'Veg_Y0',line)
+     CALL GET_Float_VAL(Veg_Yn,FILE_NAME,'Veg_Yn',line)
+     CALL GET_Float_VAL(VegH,FILE_NAME,'VegH',line)
+     CALL GET_Float_VAL(VegDens,FILE_NAME,'VegDens',line)
+     CALL GET_Float_VAL(Vegbv,FILE_NAME,'Vegbv',line)
+     CALL GET_Float_VAL(VegDrag,FILE_NAME,'VegDrag',line)
+     CALL GET_Float_VAL(VegVM,FILE_NAME,'VegVM',line)
+     if(Veg_Type(1:3)=='FLE') then
+       CALL GET_Float_VAL(EI,FILE_NAME,'EI',line)
+     endif
+# endif
 
+# if defined (LANDSLIDE)
+     ! landslide parameters                           
+     CALL GET_STRING_VAL(SlideType,FILE_NAME,'SlideType',line,ierr)
+     CALL GET_Float_VAL(SlideT,FILE_NAME,'SlideT',line)
+     CALL GET_Float_VAL(SlideL,FILE_NAME,'SlideL',line)
+     CALL GET_Float_VAL(SlideW,FILE_NAME,'SlideW',line)
+     CALL GET_Float_VAL(SlideAngle,FILE_NAME,'SlideAngle',line)
+     CALL GET_Float_VAL(SlopeAngle,FILE_NAME,'SlopeAngle',line)
+     CALL GET_Float_VAL(SlideX0,FILE_NAME,'SlideX0',line)
+     CALL GET_Float_VAL(SlideY0,FILE_NAME,'SlideY0',line)
+     if(trim(SlideType)=='RIGID') then
+       CALL GET_Float_VAL(SlideUt,FILE_NAME,'SlideUt',line)
+       CALL GET_Float_VAL(SlideA0,FILE_NAME,'SlideA0',line)
+     endif
+     if(trim(SlideType)=='DEFORMABLE') then
+       CALL GET_Float_VAL(SlideDens,FILE_NAME,'SlideDens',line)
+     endif
+# endif
 
+# if defined (TWOLAYERSLIDE)
+     ! landslide parameters           
+     CALL GET_Float_VAL(SlideT,FILE_NAME,'SlideT',line)
+     CALL GET_Float_VAL(SlideL,FILE_NAME,'SlideL',line)
+     CALL GET_Float_VAL(SlideW,FILE_NAME,'SlideW',line)
+     CALL GET_Float_VAL(SlideAngle,FILE_NAME,'SlideAngle',line)
+     CALL GET_Float_VAL(SlopeAngle,FILE_NAME,'SlopeAngle',line)
+     CALL GET_Float_VAL(SlideX0,FILE_NAME,'SlideX0',line)
+     CALL GET_Float_VAL(SlideY0,FILE_NAME,'SlideY0',line)
+     CALL GET_Float_VAL(SlideDens,FILE_NAME,'SlideDens',line)
+     CALL GET_Float_VAL(SlideVisc,FILE_NAME,'SlideVisc',line)
+     CALL GET_Float_VAL(SlideLambda,FILE_NAME,'SlideLambda',line)
+     CALL GET_Float_VAL(SlideIniU,FILE_NAME,'SlideIniU',line)
+     CALL GET_Float_VAL(Cf_ul,FILE_NAME,'Cf_ul',line)
+     CALL GET_Float_VAL(PhiInt,FILE_NAME,'PhiInt',line)
+     CALL GET_Float_VAL(PhiBed,FILE_NAME,'PhiBed',line)
+
+     PhiInt = PhiInt*pi/180.
+     PhiBed = PhiBed*pi/180.
+# endif
      
      ! whether to consider rheology
      CALL GET_LOGICAL_VAL(RHEOLOGY_ON,FILE_NAME,'RHEOLOGY_ON',line)
@@ -6051,8 +7870,13 @@
      ! probe output
      CALL GET_INTEGER_VAL(NSTAT,FILE_NAME,'NSTAT',line)
      CALL GET_Float_VAL(Plot_Intv_Stat,FILE_NAME,'PLOT_INTV_STAT',line)
+# if defined (PARALLEL)
        if(myid.eq.0) WRITE(3,'(A7,I3)')'NSTAT= ', NSTAT
        if(myid.eq.0) WRITE(3,'(A19,F6.3)')'Plot_Intv_Stat= ', Plot_Intv_Stat
+# else
+       WRITE(3,'(A7,I3)')'NSTAT= ', NSTAT
+       WRITE(3,'(A19,F6.3)')'Plot_Intv_Stat= ', Plot_Intv_Stat
+# endif
 
      if(NSTAT>0) then
        open(15,file='stat.txt',status='old')
@@ -6079,6 +7903,7 @@
      CALL GET_LOGICAL_VAL(OUT_T,FILE_NAME,'OUT_T',line)
      CALL GET_LOGICAL_VAL(OUT_G,FILE_NAME,'OUT_G',line)
      CALL GET_LOGICAL_VAL(OUT_I,FILE_NAME,'OUT_I',line)
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,'(A7,L4)') 'OUT_H= ',OUT_H
      if(myid.eq.0) WRITE(3,'(A7,L4)') 'OUT_E= ',OUT_E
      if(myid.eq.0) WRITE(3,'(A7,L4)') 'OUT_U= ',OUT_U
@@ -6095,8 +7920,30 @@
      if(myid.eq.0) WRITE(3,'(A7,L4)') 'OUT_T= ',OUT_T
      if(myid.eq.0) WRITE(3,'(A7,L4)') 'OUT_G= ',OUT_G
      if(myid.eq.0) WRITE(3,'(A7,L4)') 'OUT_I= ',OUT_I
+# else
+     WRITE(3,'(A7,L4)') 'OUT_H= ',OUT_H
+     WRITE(3,'(A7,L4)') 'OUT_E= ',OUT_E
+     WRITE(3,'(A7,L4)') 'OUT_U= ',OUT_U
+     WRITE(3,'(A7,L4)') 'OUT_V= ',OUT_V
+     WRITE(3,'(A7,L4)') 'OUT_W= ',OUT_W
+     WRITE(3,'(A7,L4)') 'OUT_P= ',OUT_P
+     WRITE(3,'(A7,L4)') 'OUT_K= ',OUT_K
+     WRITE(3,'(A7,L4)') 'OUT_D= ',OUT_D
+     WRITE(3,'(A7,L4)') 'OUT_S= ',OUT_S
+     WRITE(3,'(A7,L4)') 'OUT_C= ',OUT_C
+     WRITE(3,'(A7,L4)') 'OUT_B= ',OUT_B
+     WRITE(3,'(A7,L4)') 'OUT_A= ',OUT_A
+     WRITE(3,'(A7,L4)') 'OUT_F= ',OUT_F
+     WRITE(3,'(A7,L4)') 'OUT_T= ',OUT_T
+     WRITE(3,'(A7,L4)') 'OUT_G= ',OUT_G
+     WRITE(3,'(A7,L4)') 'OUT_I= ',OUT_I
+# endif
 
+# if defined (PARALLEL)
      if(myid.eq.0) WRITE(3,*)'--------------input end --------------'
+# else
+     WRITE(3,*)'--------------input end --------------'
+# endif
 
      end subroutine read_input
 
@@ -6237,11 +8084,91 @@
      do k = Kbeg,Kend
      do j = Jbeg,Jend
      do i = Ibeg,Iend
+# if defined (SEDIMENT)
+       if(trim(Sed_Type)=='COHESIVE') then
+         if(Conc(i,j,k)<0.1) then
+           Cmu(i,j,k) = Visc
+         else
+           Cmu(i,j,k) = Mud_Visc
+         endif
+       else
+         Cmu(i,j,k) = Visc
+       endif
+# else
        Cmu(i,j,k) = Visc
+# endif
      enddo
      enddo
      enddo
 
+# if defined (SEDIMENT)
+     ! include rheology effects
+     if(RHEOLOGY_ON) then
+       StressMag = Zero
+       do k = Kbeg,Kend
+       do j = Jbeg,Jend
+       do i = Ibeg,Iend
+         ! estimate gradient first 
+         VelGrad = Zero; Stress = Zero
+         VelGrad(1,1) = (U(i+1,j,k)-U(i-1,j,k))/(2.0*dx)+(U(i,j,k+1)-U(i,j,k-1))/(sigc(k+1)-sigc(k-1))*DelxSc(i,j,k)            
+         VelGrad(1,2) = (U(i,j+1,k)-U(i,j-1,k))/(2.0*dy)+(U(i,j,k+1)-U(i,j,k-1))/(sigc(k+1)-sigc(k-1))*DelySc(i,j,k)          
+         VelGrad(1,3) = 1./D(i,j)*(U(i,j,k+1)-U(i,j,k-1))/(sigc(k+1)-sigc(k-1))                                               
+         VelGrad(2,1) = (V(i+1,j,k)-V(i-1,j,k))/(2.0*dx)+(V(i,j,k+1)-V(i,j,k-1))/(sigc(k+1)-sigc(k-1))*DelxSc(i,j,k)              
+         VelGrad(2,2) = (V(i,j+1,k)-V(i,j-1,k))/(2.0*dy)+(V(i,j,k+1)-V(i,j,k-1))/(sigc(k+1)-sigc(k-1))*DelySc(i,j,k)               
+         VelGrad(2,3) = 1./D(i,j)*(V(i,j,k+1)-V(i,j,k-1))/(sigc(k+1)-sigc(k-1))                                                       
+         VelGrad(3,1) = (W(i+1,j,k)-W(i-1,j,k))/(2.0*dx)+(W(i,j,k+1)-W(i,j,k-1))/(sigc(k+1)-sigc(k-1))*DelxSc(i,j,k)                  
+         VelGrad(3,2) = (W(i,j+1,k)-W(i,j-1,k))/(2.0*dy)+(W(i,j,k+1)-W(i,j,k-1))/(sigc(k+1)-sigc(k-1))*DelySc(i,j,k)                  
+         VelGrad(3,3) = 1./D(i,j)*(W(i,j,k+1)-W(i,j,k-1))/(sigc(k+1)-sigc(k-1))
+
+         ! strain magnitude
+         StrainMag = Zero
+         do n = 1,3
+         do m = 1,3
+           StrainMag = StrainMag+0.5*(0.5*(VelGrad(n,m)+VelGrad(m,n)))**2                                                         
+         enddo
+         enddo
+
+         ! shear stress
+         if(IsMove(i,j,k)==1) then
+           do n = 1,3
+           do m = 1,3
+             Stress(n,m) = 2.0*Rho(i,j,k)*(Cmu(i,j,k)+CmuR(i,j,k)+CmuVt(i,j,k))*(0.5*(VelGrad(n,m)+velGrad(m,n)))
+             StressMag(i,j,k) = StressMag(i,j,k)+0.5*Stress(n,m)*Stress(n,m)
+           enddo
+           enddo
+         endif
+
+         if(Conc(i,j,k)>0.1) then
+           if(Nglob==1) then  ! 2D simulation
+             Smax = dmax1(StressMag(i-1,j,k),StressMag(i+1,j,k),StressMag(i,j,k-1),StressMag(i,j,k+1))
+           else
+             Smax = dmax1(StressMag(i-1,j,k),StressMag(i+1,j,k),StressMag(i,j,k-1),StressMag(i,j,k+1),  &
+                       StressMag(i,j-1,k),StressMag(i,j+1,k))
+           endif
+
+           if(IsMove(i,j,k)==0) then  ! originally not moving
+             if(sqrt(Smax)<Yield_Stress) then ! still not moving 
+               CmuR(i,j,k) = 1.0e+10  ! a large number                                                                              
+             else ! start moving
+               IsMove(i,j,k) = 1
+               CmuR(i,j,k) = Plastic_Visc+Yield_Stress/StrainMag/Rho(i,j,k)                                                          
+             endif
+           else  ! originally moving
+             if(sqrt(StressMag(i,j,k))<Yield_Stress) then  ! stop moving
+               IsMove(i,j,k) = 0
+               CmuR(i,j,k) = 1.e+10
+             else
+               CmuR(i,j,k) = Plastic_Visc+Yield_Stress/StrainMag/Rho(i,j,k)
+             endif
+           endif             
+         else
+           CmuR(i,j,k) = 0.0
+         endif
+       enddo
+       enddo
+       enddo
+     endif
+# endif
 
      ! vertical turbulent viscosity
      if(IVturb==1) then
@@ -6293,9 +8220,13 @@
        enddo
 
        ! ghost cell
+# if defined (PARALLEL)
        call phi_3D_exch(CmuHt)
+# endif
 
+# if defined (PARALLEL)
        if(n_west.eq.MPI_PROC_NULL) then
+# endif
        do j = Jbeg,Jend
        do k = Kbeg,Kend
          do i = 1,Nghost
@@ -6303,9 +8234,13 @@
          enddo
        enddo
        enddo
+# if defined (PARALLEL)
        endif
+# endif
 
+# if defined (PARALLEL)
        if(n_east.eq.MPI_PROC_NULL) then
+# endif
        do j = Jbeg,Jend
        do k = Kbeg,Kend
          do i = 1,Nghost
@@ -6313,9 +8248,13 @@
          enddo
        enddo
        enddo
+# if defined (PARALLEL)
        endif
+# endif
 
+# if defined (PARALLEL)
        if(n_suth.eq.MPI_PROC_NULL) then
+# endif
        do i = Ibeg,Iend
        do k = Kbeg,Kend
          do j = 1,Nghost
@@ -6323,9 +8262,13 @@
          enddo
        enddo
        enddo
+# if defined (PARALLEL)
        endif
+# endif
 
+# if defined (PARALLEL)
        if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
        do i = Ibeg,Iend
        do k = Kbeg,Kend
          do j = 1,Nghost
@@ -6333,7 +8276,9 @@
          enddo
        enddo
        enddo
+# if defined (PARALLEL)
        endif
+# endif
 
        do i = Ibeg,Iend
        do j = Jbeg,Jend
@@ -6436,6 +8381,7 @@
      end subroutine diffusion
 
 
+# if defined (PARALLEL)
     subroutine phi_2D_exch(PHI)
     USE GLOBAL
     IMPLICIT NONE
@@ -6551,8 +8497,10 @@
 
     return
     END SUBROUTINE phi_2D_exch
+# endif
 
 
+# if defined (PARALLEL)
     SUBROUTINE phi_3D_exch(PHI)
     USE GLOBAL
     IMPLICIT NONE
@@ -6692,8 +8640,10 @@
 
     return
     END SUBROUTINE phi_3D_exch
+# endif
 
 
+# if defined(PARALLEL)
     ! Jeff added this subroutine to pass mask 02/14/2011
     SUBROUTINE phi_int_exch(PHI)
     USE GLOBAL
@@ -6808,6 +8758,7 @@
        enddo
     endif
     END SUBROUTINE phi_int_exch
+# endif
 
 
     subroutine adv_scalar_hlpa(Flx,Fly,Flz,Phi,R5,IVAR)
@@ -7001,9 +8952,19 @@
     integer :: i,j,k
 
     ! temporarily set it here
+# if defined (SEDIMENT)
+    Scal_X0 = Sed_X0
+    Scal_Xn = Sed_Xn
+# endif
+# if defined (SALINITY)
+    Scal_X0 = Sin_X0
+    Scal_Xn = Sin_Xn
+# endif
 
     ! left and right side
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        if(Bc_X0==1.or.Bc_X0==2) then
@@ -7013,9 +8974,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
 !       if(Bc_Xn==1.or.Bc_Xn==2) then
@@ -7025,10 +8990,14 @@
 !       endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif      
 
      ! front and back side
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        if(Bc_Y0==1.or.Bc_Y0==2) then
@@ -7036,10 +9005,14 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        if(Bc_Yn==1.or.Bc_Yn==2) then
@@ -7047,7 +9020,9 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
     do k = Kbeg,Kend
     do j = Jbeg,Jend
@@ -7159,9 +9134,13 @@
     enddo
     enddo
 
+# if defined (PARALLEL)
     call phi_3D_exch(CmuVt)
+# endif
 
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        if(WaveMaker(1:3)=='LEF') then
@@ -7177,9 +9156,13 @@
        endif
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        do i = 1,Nghost
@@ -7187,9 +9170,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
     
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        do j = 1,Nghost
@@ -7197,9 +9184,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        do j = 1,Nghost
@@ -7207,7 +9198,9 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif       
 
      ! no turbulence in the internal wavemaker region   
     if(WaveMaker(1:3)=='INT') then
@@ -7462,6 +9455,34 @@
     enddo
     enddo
 
+# if defined (VEGETATION)
+    do i = Ibeg,Iend
+    do j = Jbeg,Jend
+    do k = Kbeg,Kend
+      if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=Veg_Y0.and.Yc(j)<=Veg_Yn)) then
+        if(trim(Veg_Type)=='RIGID') then ! rigid vegetation                                                 
+          if(sigc(k)*D(i,j)<=VegH) then
+            Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+            Prod_v(i,j,k) = 0.5*Vegbv*VegDens*VegDrag*Umag**3
+          else
+            Prod_v(i,j,k) = 0.0
+          endif
+        else  ! flexible vegetation                                                                          
+          if(sigc(k)*D(i,j)<=FVegH(i,j)) then
+            Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+            Prod_v(i,j,k) = 0.5*Vegbv*VegDens*VegDrag*foliage(i,j)*  &                                       
+                    VegH/FVegH(i,j)*Umag**3
+          else
+            Prod_v(i,j,k) = 0.0
+          endif
+        endif
+      else
+        Prod_v(i,j,k) = 0.0
+      endif
+    enddo
+    enddo
+    enddo
+# endif
 
     Nlen = Kend-Kbeg+1
     allocate(Acoef(Nlen))
@@ -7485,8 +9506,13 @@
 
       Nlen = 0
       do k = Kbeg,Kend
+# if defined (VEGETATION)
+        R5(i,j,k) = R5(i,j,k)+c1e*D(i,j)*(Prod_s(i,j,k)+c3e*Prod_b(i,j,k)+  &
+                cfe*Prod_v(i,j,k))*Eps_Old(i,j,k)/Tke_Old(i,j,k)            
+# else
         R5(i,j,k) = R5(i,j,k)+c1e*D(i,j)*(Prod_s(i,j,k)+  &
                 c3e*Prod_b(i,j,k))*Eps_Old(i,j,k)/Tke_Old(i,j,k)                        
+# endif
         Nlen = Nlen+1
         if(k==Kbeg) then
           Acoef(Nlen) = 0.0
@@ -7540,7 +9566,11 @@
 
       Nlen = 0
       do k = Kbeg,Kend
+# if defined (VEGETATION)
+        R5(i,j,k) = R5(i,j,k)+D(i,j)*(Prod_s(i,j,k)+Prod_b(i,j,k)+cfk*Prod_v(i,j,k))-DEps(i,j,k)      
+# else
         R5(i,j,k) = R5(i,j,k)+D(i,j)*(Prod_s(i,j,k)+Prod_b(i,j,k))-DEps(i,j,k)                                                   
+# endif
         Nlen = Nlen+1
         if(k==Kbeg) then
           Acoef(Nlen) = 0.0
@@ -7645,10 +9675,14 @@
     enddo
     enddo
 
+# if defined (PARALLEL)
     call phi_3D_exch(DTke)
     call phi_3D_exch(DEps)
+# endif
 
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = 1,Kloc
        do i = 1,Nghost
@@ -7657,9 +9691,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = 1,Kloc
        do i = 1,Nghost
@@ -7668,9 +9706,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
     
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      do i = 1,Mloc
      do k = 1,Kloc
        do j = 1,Nghost
@@ -7679,9 +9721,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      do i = 1,Mloc
      do k = 1,Kloc
        do j = 1,Nghost
@@ -7690,7 +9736,9 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
    
     do i = 1,Mloc
@@ -7833,6 +9881,34 @@
     enddo
     enddo
 
+# if defined (VEGETATION)
+    do i = Ibeg,Iend
+    do j = Jbeg,Jend
+    do k = Kbeg,Kend
+      if(xc(i)>=Veg_X0.and.xc(i)<=Veg_Xn.and.(Yc(j)>=Veg_Y0.and.Yc(j)<=Veg_Yn)) then
+        if(trim(Veg_Type)=='RIGID') then ! rigid vegetation                                                 
+          if(sigc(k)*D(i,j)<=VegH) then
+            Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+            Prod_v(i,j,k) = 0.5*Vegbv*VegDens*VegDrag*Umag**3
+          else
+            Prod_v(i,j,k) = 0.0
+          endif
+        else  ! flexible vegetation                                                                          
+          if(sigc(k)*D(i,j)<=FVegH(i,j)) then
+            Umag = sqrt(U(i,j,k)**2+V(i,j,k)**2+W(i,j,k)**2)
+            Prod_v(i,j,k) = 0.5*Vegbv*VegDens*VegDrag*foliage(i,j)*  &                                       
+                    VegH/FVegH(i,j)*Umag**3
+          else
+            Prod_v(i,j,k) = 0.0
+          endif
+        endif
+      else
+        Prod_v(i,j,k) = 0.0
+      endif
+    enddo
+    enddo
+    enddo
+# endif
 
     Nlen = Kend-Kbeg+1
     allocate(Acoef(Nlen))
@@ -7856,7 +9932,11 @@
 
       Nlen = 0
       do k = Kbeg,Kend
+# if defined (VEGETATION)
+        R5(i,j,k) = R5(i,j,k)+c1e*D(i,j)*(Prod_s(i,j,k)+c3e*Prod_b(i,j,k)+cfe*Prod_v(i,j,k))*Eps_Old(i,j,k)/Tke_Old(i,j,k)            
+# else
         R5(i,j,k) = R5(i,j,k)+c1e*D(i,j)*(Prod_s(i,j,k)+c3e*Prod_b(i,j,k))*Eps_Old(i,j,k)/Tke_Old(i,j,k)                        
+# endif
         Nlen = Nlen+1
         if(k==Kbeg) then
           Acoef(Nlen) = 0.0
@@ -7906,7 +9986,11 @@
 
       Nlen = 0
       do k = Kbeg,Kend
+# if defined (VEGETATION)
+        R5(i,j,k) = R5(i,j,k)+D(i,j)*(Prod_s(i,j,k)+Prod_b(i,j,k)+cfk*Prod_v(i,j,k))-DEps(i,j,k)                                              
+# else
         R5(i,j,k) = R5(i,j,k)+D(i,j)*(Prod_s(i,j,k)+Prod_b(i,j,k))-DEps(i,j,k)                                                   
+# endif
         Nlen = Nlen+1
         if(k==Kbeg) then
           Acoef(Nlen) = 0.0
@@ -8001,10 +10085,14 @@
     enddo
     enddo
 
+# if defined (PARALLEL)
     call phi_3D_exch(DTke)
     call phi_3D_exch(DEps)
+# endif
 
+# if defined (PARALLEL)
      if(n_west.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        if(WaveMaker(1:3)=='LEF') then
@@ -8023,9 +10111,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_east.eq.MPI_PROC_NULL) then
+# endif
      do j = Jbeg,Jend
      do k = Kbeg,Kend
        do i = 1,Nghost
@@ -8034,9 +10126,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
     
+# if defined (PARALLEL)
      if(n_suth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        do j = 1,Nghost
@@ -8045,9 +10141,13 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
+# if defined (PARALLEL)
      if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
      do i = Ibeg,Iend
      do k = Kbeg,Kend
        do j = 1,Nghost
@@ -8056,7 +10156,9 @@
        enddo
      enddo
      enddo
+# if defined (PARALLEL)
      endif
+# endif
 
     do i = 1,Mloc
     do j = 1,Nloc
@@ -8163,10 +10265,1204 @@
     end subroutine wall_time_secs
 
 
+# if defined (BUBBLE)
+    subroutine bslip_velocity
+!----------------------------------------------------------
+!   Specify bubble radius and calculate rise velocity
+!   Last update: Gangfeng Ma, 09/01/2011
+!---------------------------------------------------------
+    use global, only: SP,pi,Zero,Rho0,Mg,Rbg,DRbg,Wbg,Entrain,Con_b,Surface_Tension
+    implicit none
+    integer :: g
+    real(SP) :: rlogR0,rlogRn,rlogR1,rlogR2,rlogN0,alpha_b,beta_b,sum_e
+    real(SP), dimension(Mg) :: rlogN,specN,binN             
+
+    ! specify bubble radius
+    rlogR0 = -1.0
+    rlogRn = 1.0
+    do g = 1,Mg
+      rlogR1 = rlogR0+(rlogRn-rlogR0)*(g-1)/float(Mg)
+      rlogR2 = rlogR0+(rlogRn-rlogR0)*g/float(Mg)
+      Rbg(g) = (0.5*(10**rlogR1+10**rlogR2))*0.001
+      DRbg(g) = (10**rlogR2-10**rlogR1)*0.001
+    enddo
+
+    ! slip velocity
+    do g = 1,Mg
+      if(Rbg(g)<=7.0e-4) then
+        Wbg(g) = 4474.*Rbg(g)**1.357
+      elseif(Rbg(g)>5.1e-3) then
+        Wbg(g) = 4.202*Rbg(g)**0.547
+      else
+        Wbg(g) = 0.23
+      endif
+    enddo
+
+    ! read bubble size distribution in Deane and Stokes' paper
+    rlogN0 = 4.3
+    alpha_b = -3.0/2.0
+    beta_b = -10.0/3.0
+
+    rlogN(1) = rlogN0
+    do g = 2,Mg/2
+      rlogN(g) = rlogN(g-1)+alpha_b*(log10(Rbg(g))-log10(Rbg(g-1)))
+    enddo
+    do g = Mg/2+1,Mg
+      rlogN(g) = rlogN(g-1)+beta_b*(log10(Rbg(g))-log10(Rbg(g-1)))
+    enddo
+
+    do g = 1,Mg
+      specN(g) = 10**rlogN(g)*1.0e+6  ! convert to 1/(m^4)
+      binN(g)  = specN(g)*DRbg(g)
+    enddo
+
+    ! entrainment coefficient
+    sum_e = zero
+    do g = 1,Mg
+      sum_e = sum_e+Rbg(g)**2*binN(g)
+    enddo
+
+    do g = 1,Mg
+      Entrain(g) = Con_b/(4.0*pi)*(Surface_Tension/Rho0)**(-1)*binN(g)/sum_e
+    enddo
+
+    end subroutine bslip_velocity
+
+    
+    subroutine eval_bub(ISTEP)
+!---------------------------------------------------------------------
+!   Update bubble concentration
+!   Last update: Gangfeng Ma, 09/01/2011
+!---------------------------------------------------------------------
+    use global
+    implicit none
+    integer, intent(in) :: ISTEP
+    real(SP), dimension(:,:,:), allocatable :: R5,Phi,DPhi,bkup_pdf,DUfs,DVfs,Wfs
+    real(SP), dimension(:,:), allocatable :: bkup_freq
+    real(SP), dimension(:), allocatable :: Acoef,Bcoef,Ccoef,Xsol,Rhs0
+    real(SP) :: bkup_c,bkup_beta,bkup_f,eps_crit,db_star,db_min,  &
+                db_max,db_crit,delta_db,db_l,db_r,db_m,pdf_integral,Schb, &
+                Ws
+    integer :: i,j,k,g,l,m,n,IVAR,NGRD,IGRD,Nlen
+
+    NGRD = 0
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      NGRD = NGRD+1
+    enddo
+    enddo
+    enddo
+
+    allocate(R5(Mloc,Nloc,Kloc))
+    allocate(DUfs(Mloc1,Nloc,Kloc))
+    allocate(DVfs(Mloc,Nloc1,Kloc))
+    allocate(Wfs(Mloc,Nloc,Kloc1))
+    allocate(Phi(Mloc,Nloc,Kloc))
+    allocate(DPhi(Mloc,Nloc,Kloc))
+    allocate(bkup_freq(NGRD,Mg))
+    allocate(bkup_pdf(NGRD,Mg,Mg))
+
+    Nlen = Kend-Kbeg+1
+    allocate(Acoef(Nlen))
+    allocate(Bcoef(Nlen))
+    allocate(Ccoef(Nlen))
+    allocate(Xsol(Nlen))
+    allocate(Rhs0(Nlen))
+
+    ! bubble breakup (Martinez-Bazan et al., 1999, 2010)
+    bkup_c = 0.25
+    bkup_beta = 8.2
+
+    bkup_freq = 0.0
+    bkup_pdf = 0.0
+    IGRD = 0
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      IGRD = IGRD+1
+      do g = 2,Mg
+        bkup_f = bkup_beta*(Eps(i,j,k)*2.0*Rbg(g))**(2.0/3.0)-12.0*Surface_Tension/(Rho0*2.0*Rbg(g))
+        if(bkup_f>zero) then
+          bkup_freq(IGRD,g) = bkup_c*sqrt(bkup_f)/(2.0*Rbg(g))
+        else
+          bkup_freq(IGRD,g) = zero
+        endif
+      enddo
+
+      do n = 2,Mg
+      do m = 1,Mg-1
+        eps_crit = (12.0*Surface_Tension/(bkup_beta*Rho0))**1.5*  &
+             (2.0*Rbg(n))**(-2.5)
+        if(Eps(i,j,k)<=eps_crit) then
+          bkup_pdf(IGRD,m,n) = zero
+        elseif(Rbg(n)<=Rbg(m)) then
+          bkup_pdf(IGRD,m,n) = zero
+        else
+          db_star = Rbg(g)/Rbg(n)
+          db_crit = (12.0*Surface_Tension/(bkup_beta*Rho0))**0.6*  &
+              Eps(i,j,k)**(-0.4)/(2.0*Rbg(n))
+          db_min = (12.0*Surface_Tension/(bkup_beta*Rho0*2.0*Rbg(n)))**1.5*  &
+              Eps(i,j,k)**(-1.0)/(2.0*Rbg(n))
+          db_max = (1.0-db_min**3)**(1.0/3.0)
+
+          if(db_max<=db_min.or.db_star<db_min.or.db_star>db_max) then
+            bkup_pdf(IGRD,m,n) = zero
+          else
+            pdf_integral = zero
+            delta_db = (db_max-db_min)/100.0
+            do l = 1,100
+              db_l = db_min+(l-1)*delta_db
+              db_r = db_min+l*delta_db
+              db_m = 0.5*(db_min+db_max)        
+              
+              pdf_integral = pdf_integral+  &
+                 db_m**2.0*(db_m**(2./3.))-db_crit**(5./3.)*  &
+                 ((1.0-db_m**3.)**(2./9.)-db_crit**(5./3.))*delta_db
+            enddo
+
+            bkup_pdf(IGRD,m,n) = db_star**2.0*(db_star**(2.0/3.0)-db_crit**(5.0/3.0))*  &
+                 ((1.0-db_star**3.0)**(2.0/9.0)-db_crit**(5.0/3.0))/pdf_integral
+          endif
+        endif
+      enddo
+      enddo
+    enddo
+    enddo
+    enddo
+
+    do g = 1,Mg
+      ! temporary arrays
+      do k = 1,Kloc
+      do j = 1,Nloc
+      do i = 1,Mloc
+        Phi(i,j,k) = Nbg(i,j,k,g)
+        DPhi(i,j,k) = DNbg(i,j,k,g)
+      enddo
+      enddo
+      enddo
+
+      DUfs = Ex
+      DVfs = Ey
+      Wfs = Omega+Wbg(g)
+
+      ! advection and diffusion 
+      IVAR = 5     
+      call adv_scalar_hlpa(DUfs,DVfs,Wfs,Phi,R5,IVAR)
+
+      ! bubble entrainment at the surface                                                                
+      k = Kend
+      do j = Jbeg,Jend
+      do i = Ibeg,Iend
+        if(Eps(i,j,k)>Eps_Cric.and.Vbg(i,j,k)<0.4) then
+          R5(i,j,k) = R5(i,j,k)+(1.0-Vbg(i,j,k))*Entrain(g)*D(i,j)*Eps(i,j,k)                                     
+        endif
+      enddo
+      enddo
+
+!      ! account for bubble breakup           
+!      IGRD = 0  
+!      do k = Kbeg,Kend  
+!      do j = Jbeg,Jend  
+!      do i = Ibeg,Iend  
+!        IGRD = IGRD+1 
+!        if(g>=2) then  ! sink   
+!          R5(i,j,k) = R5(i,j,k)-bkup_freq(IGRD,g)*DNbg(i,j,k,g)  
+!        endif 
+!    
+!        if(g<=Mg-1) then ! source  
+!          do n = 2,Mg 
+!            R5(i,j,k) = R5(i,j,k)+  &  
+!                2.0*bkup_pdf(IGRD,g,n)/(2.0*Rbg(n))*bkup_freq(IGRD,n)*DNbg(i,j,k,n)*(2.0*DRbg(n)) 
+!          enddo 
+!        endif 
+!      enddo 
+!      enddo 
+!      enddo
+
+      Schb = 0.7
+      do i = Ibeg,Iend
+      do j = Jbeg,Jend
+        if(Mask(i,j)==0) cycle
+
+        Nlen = 0
+        do k = Kbeg,Kend
+          Nlen = Nlen+1
+          if(k==Kbeg) then
+            Acoef(Nlen) = 0.0
+          else
+            Acoef(Nlen) = -dt/D(i,j)**2*(0.5*(Cmu(i,j,k-1)+Cmu(i,j,k))+0.5*(CmuVt(i,j,k-1)+CmuVt(i,j,k))/Schb)/(0.5*dsig(k)*(dsig(k)+dsig(k-1)))
+          endif
+
+          if(k==Kend) then
+            Ccoef(Nlen) = 0.0
+          else
+            Ccoef(Nlen) = -dt/D(i,j)**2*(0.5*(Cmu(i,j,k)+Cmu(i,j,k+1))+0.5*(CmuVt(i,j,k)+CmuVt(i,j,k+1))/Schb)/(0.5*dsig(k)*(dsig(k)+dsig(k+1)))
+          endif
+        
+          Bcoef(Nlen) = 1.0-Acoef(Nlen)-Ccoef(Nlen)
+
+          Rhs0(Nlen) = DPhi(i,j,k)+dt*R5(i,j,k)
+        enddo
+      
+        call trig(Acoef,Bcoef,Ccoef,Rhs0,Xsol,Nlen)
+
+        Nlen = 0
+        do k = Kbeg,Kend
+          Nlen = Nlen+1
+          DNbg(i,j,k,g) = Xsol(Nlen)
+        enddo
+      enddo
+      enddo
+
+      do k = Kbeg,Kend
+      do j = Jbeg,Jend
+      do i = Ibeg,Iend
+        DNbg(i,j,k,g) = ALPHA(ISTEP)*DNbg0(i,j,k,g)+BETA(ISTEP)*DNbg(i,j,k,g)
+        if(Mask(i,j)==0) DNbg(i,j,k,g) = Zero
+      enddo
+      enddo
+      enddo
+    enddo
+
+    ! collect data into ghost cells
+# if defined (PARALLEL)
+    do g = 1,Mg
+      do k = 1,Kloc
+      do j = 1,Nloc
+      do i = 1,Mloc
+        DPhi(i,j,k) = DNbg(i,j,k,g)
+      enddo
+      enddo
+      enddo
+
+      call phi_3D_exch(DPhi)
+
+      do k = 1,Kloc
+      do j = 1,Nloc
+      do i = 1,Mloc
+        DNbg(i,j,k,g) = DPhi(i,j,k)
+      enddo
+      enddo
+      enddo
+    enddo
+# endif          
+
+# if defined (PARALLEL)
+    if(n_west.eq.MPI_PROC_NULL) then
+# endif
+    do g = 1,Mg
+    do j = Jbeg,Jend
+    do k = Kbeg,Kend
+      do i = 1,Nghost
+        DNbg(Ibeg-i,j,k,g) = DNbg(Ibeg+i-1,j,k,g)
+      enddo
+    enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_east.eq.MPI_PROC_NULL) then
+# endif
+    do g = 1,Mg
+    do j = Jbeg,Jend
+    do k = Kbeg,Kend
+      do i = 1,Nghost
+        DNbg(Iend+i,j,k,g) = DNbg(Iend-i+1,j,k,g)
+      enddo
+    enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_suth.eq.MPI_PROC_NULL) then
+# endif
+    do g = 1,Mg
+    do i = Ibeg,Iend
+    do k = Kbeg,Kend
+      do j = 1,Nghost
+        DNbg(i,Jbeg-j,k,g) = DNbg(i,Jbeg+j-1,k,g)
+      enddo
+    enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif 
+
+# if defined (PARALLEL)
+    if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
+    do g = 1,Mg
+    do i = Ibeg,Iend
+    do k = Kbeg,Kend
+      do j = 1,Nghost
+        DNbg(i,Jend+j,k,g) = DNbg(i,Jend-j+1,k,g)
+      enddo
+    enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+    do g = 1,Mg
+    do i = Ibeg,Iend
+    do j = Jbeg,Jend
+      do k = 1,Nghost
+        DNbg(i,j,Kbeg-k,g) = DNbg(i,j,Kbeg+k-1,g)
+      enddo
+      do k = 1,Nghost
+        DNbg(i,j,Kend+k,g) = DNbg(i,j,Kend-k+1,g)
+      enddo
+    enddo
+    enddo
+    enddo
+
+    ! update bubble number density
+    Nbg = Zero
+    do g = 1,Mg
+    do k = 1,Kloc
+    do j = 1,Nloc
+    do i = 1,Mloc
+      if(Mask(i,j)==1) then
+        Nbg(i,j,k,g) = DNbg(i,j,k,g)/D(i,j)
+      endif
+    enddo
+    enddo
+    enddo
+    enddo
+
+    ! calculate void fraction
+    Vbg = Zero
+    do k = 1,Kloc
+    do j = 1,Nloc
+    do i = 1,Mloc
+      do g = 1,Mg
+        Vbg(i,j,k) = Vbg(i,j,k)+4./3.*pi*Rbg(g)**3*Nbg(i,j,k,g)
+        if(abs(Vbg(i,j,k))<1.e-16) Vbg(i,j,k) = 0.0
+        Vbg(i,j,k) = min(0.4,Vbg(i,j,k))
+      enddo
+    enddo
+    enddo
+    enddo
+
+    ! update cell density
+    do k = 1,Kloc
+    do j = 1,Nloc
+    do i = 1,Mloc
+      Rho(i,j,k) = (1.0-Vbg(i,j,k))*Rho0+Vbg(i,j,k)*RhoA
+    enddo
+    enddo
+    enddo
+
+    deallocate(R5)
+    deallocate(DUfs)
+    deallocate(DVfs)
+    deallocate(Wfs)
+    deallocate(Phi)
+    deallocate(DPhi)
+    deallocate(bkup_freq)
+    deallocate(bkup_pdf)
+    deallocate(Acoef)
+    deallocate(Bcoef)
+    deallocate(Ccoef)
+    deallocate(Xsol)
+    deallocate(Rhs0)
+
+    end subroutine eval_bub
+# endif
 
 
+# if defined (SEDIMENT)
+    subroutine settling_velocity
+!----------------------------------------------------------
+!   Calculate settling velocity for sediment
+!   Last update: Gangfeng Ma, 14/06/2012
+!--------------------------------------------------------- 
+    use global, only: SP,pi,Zero,Grav,Wset,Sd50,Visc,Rho0,Srho, &
+                      Mloc,Nloc,Kloc,Conc,ntyws,Sedi_Ws
+    implicit none
+    real(SP) :: sr,c1,c2
+    integer :: i,j,k
+
+    do k = 1,Kloc
+    do j = 1,Nloc
+    do i = 1,Mloc
+      if(ntyws==1) then
+        ! pre-defined
+        Wset = Sedi_Ws
+      elseif(ntyws==2) then
+        ! related to d50
+        sr = Srho/Rho0
+        Wset = sqrt((sr-1.0)*Grav*Sd50)*  &
+            (sqrt(2.0/3.0+36.0*Visc**2/((sr-1.0)*Grav*Sd50**3))-  &
+             sqrt(36.0*Visc**2/((sr-1.0)*Grav*Sd50**3)))      
+      elseif(ntyws==3) then
+        sr = Srho/Rho0
+        Wset = (sr-1.0)*Grav*Sd50**2/18.0/Visc
+      endif
+    enddo
+    enddo
+    enddo
+
+    return
+    end subroutine settling_velocity
 
 
+    subroutine eval_sedi(ISTEP)
+!---------------------------------------------------------------------
+!   Update sediment concentration
+!   Last update: Gangfeng Ma, 09/01/2011
+!---------------------------------------------------------------------
+    use global
+    implicit none
+    integer, intent(in) :: ISTEP
+    real(SP), dimension(:,:,:), allocatable :: R5,DUfs,DVfs,Wfs
+    real(SP), dimension(:), allocatable :: Acoef,Bcoef,Ccoef,Xsol,Rhs0
+    real(SP) :: SchC
+    integer :: i,j,k,IVAR,Nlen
+
+    allocate(R5(Mloc,Nloc,Kloc))
+    allocate(DUfs(Mloc1,Nloc,Kloc))
+    allocate(DVfs(Mloc,Nloc1,Kloc))
+    allocate(Wfs(Mloc,Nloc,Kloc1))
+
+    Nlen = Kend-Kbeg+1
+    allocate(Acoef(Nlen))
+    allocate(Bcoef(Nlen))
+    allocate(Ccoef(Nlen))
+    allocate(Xsol(Nlen))
+    allocate(Rhs0(Nlen))   
+
+# if !defined (LANDSLIDE)
+    ! sediment entrainment at the bottom
+    if(trim(Sed_Type)=='COHESIVE') then
+      call SSource
+    else
+      call SedPickup
+    endif
+# endif
+
+    DUfs = Ex
+    DVfs = Ey
+    Wfs = Omega-Wset
+
+    ! advection and horizontal diffusion 
+    IVAR = 6     
+    call adv_scalar_hlpa(DUfs,DVfs,Wfs,Conc,R5,IVAR)
+
+    ! vertical diffusion
+    if(VISCOUS_FLOW) then
+      SchC = 0.7
+      do i = Ibeg,Iend
+      do j = Jbeg,Jend
+        if(Mask(i,j)==0) cycle
+
+        Nlen = 0
+        do k = Kbeg,Kend
+          Nlen = Nlen+1
+          if(k==Kbeg) then
+            Acoef(Nlen) = 0.0
+          else
+            Acoef(Nlen) = -dt/D(i,j)**2*(0.5*(Cmu(i,j,k-1)+Cmu(i,j,k))+  &
+                 0.5*(CmuVt(i,j,k-1)+CmuVt(i,j,k))/SchC)/(0.5*dsig(k)*(dsig(k)+dsig(k-1)))
+          endif
+
+          if(k==Kend) then
+            Ccoef(Nlen) = 0.0
+          else
+            Ccoef(Nlen) = -dt/D(i,j)**2*(0.5*(Cmu(i,j,k)+Cmu(i,j,k+1))+  &
+                 0.5*(CmuVt(i,j,k)+CmuVt(i,j,k+1))/SchC)/(0.5*dsig(k)*(dsig(k)+dsig(k+1)))
+          endif
+        
+          Bcoef(Nlen) = 1.0-Acoef(Nlen)-Ccoef(Nlen)
+
+          if(k==Kbeg) then
+            Rhs0(Nlen) = DConc(i,j,k)+dt*R5(i,j,k)-dt/D(i,j)*SSour(i,j)/dsig(k)
+          else
+            Rhs0(Nlen) = DConc(i,j,k)+dt*R5(i,j,k)
+          endif
+        enddo
+      
+        call trig(Acoef,Bcoef,Ccoef,Rhs0,Xsol,Nlen)
+
+        Nlen = 0
+        do k = Kbeg,Kend
+          Nlen = Nlen+1
+          DConc(i,j,k) = Xsol(Nlen)
+        enddo
+      enddo
+      enddo
+
+      ! update sediment concentration
+      do k = Kbeg,Kend
+      do j = Jbeg,Jend
+      do i = Ibeg,Iend
+        DConc(i,j,k) = ALPHA(ISTEP)*DConc0(i,j,k)+BETA(ISTEP)*DConc(i,j,k)
+        if(Mask(i,j)==0) DConc(i,j,k) = Zero
+        DConc(i,j,k) = dmax1(DConc(i,j,k),Zero)
+      enddo
+      enddo
+      enddo
+    else
+      ! update sediment concentration 
+      do k = Kbeg,Kend
+      do j = Jbeg,Jend
+      do i = Ibeg,Iend
+        DConc(i,j,k) = ALPHA(ISTEP)*DConc0(i,j,k)+  &
+                  BETA(ISTEP)*(DConc(i,j,k)+dt*R5(i,j,k)) 
+        if(Mask(i,j)==0) DConc(i,j,k) = Zero
+        DConc(i,j,k) = dmax1(DConc(i,j,k),Zero)
+      enddo
+      enddo
+      enddo
+    endif
+
+    ! update sediment concentration
+    Conc = Zero
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Mask(i,j)==1) then
+        Conc(i,j,k) = DConc(i,j,k)/D(i,j)
+      endif
+    enddo
+    enddo
+    enddo
+
+    ! collect data into ghost cells
+    call sedi_bc
+# if defined (PARALLEL)
+    call phi_3D_exch(Conc)
+# endif
+
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Conc(i,j,k)>0.1) then
+        write(12,*) DConc(i,j,k),D(i,j),Conc(i,j,k)
+      endif
+    enddo
+    enddo
+    enddo
+
+    deallocate(R5)
+    deallocate(Acoef)
+    deallocate(Bcoef)
+    deallocate(Ccoef)
+    deallocate(Xsol)
+    deallocate(Rhs0)
+    deallocate(DUfs)
+    deallocate(DVfs)
+    deallocate(Wfs)
+
+    return
+    end subroutine eval_sedi
+
+    
+    subroutine sedi_bc
+! ------------------------------------------------------
+!
+!   boundary condition for sediment concentration
+!
+!------------------------------------------------------
+    use global
+    implicit none
+    integer :: i,j,k
+
+# if defined (PARALLEL)
+    if(n_west.eq.MPI_PROC_NULL) then
+# endif
+    do j = Jbeg,Jend
+    do k = Kbeg,Kend
+      do i = 1,Nghost
+        if(Bc_X0==3) then
+          Conc(Ibeg-i,j,k) = Sed_X0(j,k)
+        else
+          Conc(Ibeg-i,j,k) = Conc(Ibeg+i-1,j,k)
+        endif
+      enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_east.eq.MPI_PROC_NULL) then
+# endif
+    do j = Jbeg,Jend
+    do k = Kbeg,Kend
+      do i = 1,Nghost
+!        if(Bc_Xn==3) then
+!          Conc(Iend+i,j,k) = Sed_Xn(j,k)
+!        else
+          Conc(Iend+i,j,k) = Conc(Iend-i+1,j,k)
+!        endif
+      enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_suth.eq.MPI_PROC_NULL) then
+# endif
+    do i = Ibeg,Iend
+    do k = Kbeg,Kend
+      do j = 1,Nghost
+        Conc(i,Jbeg-j,k) = Conc(i,Jbeg+j-1,k)
+      enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
+    do i = Ibeg,Iend
+    do k = Kbeg,Kend
+      do j = 1,Nghost
+        Conc(i,Jend+j,k) = Conc(i,Jend-j+1,k)
+      enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+    do i = Ibeg,Iend
+    do j = Jbeg,Jend
+      do k = 1,Nghost
+        Conc(i,j,Kbeg-k) = Conc(i,j,Kbeg+k-1)
+      enddo
+      do k = 1,Nghost
+        Conc(i,j,Kend+k) = Conc(i,j,Kend-k+1)
+      enddo
+    enddo
+    enddo
+
+    end subroutine sedi_bc
+
+    subroutine SSource
+!-----------------------------------------------------------
+!   Sediment suspension and deposition at the bottom
+!   Called by 
+!      eval_sedi
+!   Last update: 15/06/2012, Gangfeng Ma 
+!-----------------------------------------------------------
+    use global
+    implicit none
+    integer, parameter :: ntyss=1
+    integer :: i,j,k,k0
+    real(SP) :: Dz1,Cdrag,Qero,Qdep,c1,c2,c3,SStar,Umag,Um,Vm,Cm
+
+    SSour = Zero
+    Taub = Zero
+
+    k = Kbeg
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Mask(i,j)==0) cycle
+
+      if(ntyss==1) then
+        ! sediment erosion/deposition depends on shear stress
+        ! bottom shear stress             
+        Dz1 = 0.5*D(i,j)*dsig(k)
+        if(ibot==1) then
+          Cdrag = Cd0
+        else
+# if defined (SEDIMENT)
+          Cdrag = 1./(1./Kappa*(1.+Af*Richf(i,j,Kbeg))*log(30.0*Dz1/Zob))**2                                                          
+# else
+          Cdrag = 1./(1./Kappa*log(30.0*Dz1/Zob))**2
+# endif
+        endif
+        Taub(i,j) = Rho0*Cdrag*(U(i,j,Kbeg)**2+V(i,j,Kbeg)**2)
+
+        if(Taub(i,j)>=Tau_ce) then
+          Qero = Erate*(Taub(i,j)/Tau_ce-1.0)
+        else
+          Qero = 0.0
+        endif
+
+        if(Taub(i,j)<=Tau_cd) then
+          Qdep = Wset*Conc(i,j,k)*(1.0-Taub(i,j)/Tau_cd)
+        else
+          Qdep = 0.0
+        endif
+
+        SSour(i,j) = Qdep-Qero
+      elseif(ntyss==2) then
+        Um = Zero
+        Vm = Zero
+        Cm = Zero
+        do k0 = Kbeg,Kend
+          Um = Um+U(i,j,k0)/float(Kend-Kbeg+1)
+          Vm = Vm+V(i,j,k0)/float(Kend-Kbeg+1)
+          Cm = Cm+Conc(i,j,k0)/float(Kend-Kbeg+1)
+        enddo
+
+        ! use sediment carrying capacity concenpt
+        c1 = 0.007
+        c2 = 0.92
+        c3 = 50.0
+        Umag = sqrt(Um**2+Vm**2)
+        SStar = c1*(Umag**3/D(i,j)/Wset)**c2
+        SSour(i,j) = c3*Wset*(Cm-SStar)
+      endif
+    enddo
+    enddo
+
+    return
+    end subroutine SSource
+
+   
+    subroutine SedPickup
+!-----------------------------------------------------------
+!   Calculate sand pickup 
+!   Called by
+!      eval_sedi
+!   Last update: 02/04/2013, Gangfeng Ma
+!-----------------------------------------------------------
+    use global
+    implicit none
+    integer :: i,j,k
+    real(SP) :: Dz1,Cdrag,sr,Qero,Qdep,Shields,taub1 
+ 
+    SSour = Zero
+    Taub = Zero
+
+    k = Kbeg
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Mask(i,j)==0) cycle
+
+      Dz1 = 0.5*D(i,j)*dsig(Kbeg)
+      if(ibot==1) then
+        Cdrag = Cd0
+      else
+        Cdrag = 1./(1./Kappa*(1.+Af*Richf(i,j,Kbeg))*log(30.0*Dz1/Zob))**2 
+      endif
+      Taub1 = Cdrag*(U(i,j,k)**2+V(i,j,k)**2)
+
+      ! Shields number
+      sr = Srho/Rho0
+      Shields = Taub1/(sr-1.0)/Grav/SD50
+
+      ! Pickup rate
+      if(Shields>Shields_c) then
+        Qero = 0.00033*((Shields-Shields_c)/Shields_c)**1.5*  &
+             (sr-1.0)**0.6*Grav**0.6*SD50**0.8/Visc**0.2
+      else
+        Qero = Zero
+      endif
+
+      ! Deposition rate
+      Qdep = Wset*Conc(i,j,k)
+    
+      ! Bottom exchange rate
+      SSour(i,j) = Qdep-Qero
+   
+    enddo
+    enddo
+
+    end subroutine SedPickup
+
+
+    subroutine eval_bedload
+!---------------------------------------------------------
+!   Calculate bed load transport rate
+!   Called by 
+!      main
+!   Last update: 12/07/2012, Gangfeng Ma
+!--------------------------------------------------------
+    use global
+    implicit none
+    integer :: i,j,k
+    real(SP) :: Taubx,Tauby,Cdrag,Dz1,sr,Shields,  &
+                Shields_x,Shields_y,fw,Umag
+
+    k = Kbeg
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Mask(i,j)==0) cycle
+
+      ! bottom shear stress     
+!      Dz1 = 0.5*D(i,j)*dsig(Kbeg)
+!      if(ibot==1) then
+!        Cdrag = Cd0
+!      else
+!        Cdrag = 1./(1./Kappa*log(30.0*Dz1/Zob))**2     
+!      endif
+!      Taubx = Cdrag*sqrt(U(i,j,Kbeg)**2+V(i,j,Kbeg)**2)*U(i,j,Kbeg)
+!      Tauby = Cdrag*sqrt(U(i,j,Kbeg)**2+V(i,j,Kbeg)**2)*V(i,j,Kbeg)
+ 
+      fw = 0.01
+      Taubx = 0.5*fw*sqrt(U(i,j,Kbeg)**2+V(i,j,Kbeg)**2)*U(i,j,Kbeg)
+      Tauby = 0.5*fw*sqrt(U(i,j,Kbeg)**2+V(i,j,Kbeg)**2)*V(i,j,Kbeg)
+
+      ! Shields number
+      sr = Srho/Rho0
+      Shields_x = Taubx/(sr-1.0)/Grav/SD50
+      Shields_y = Tauby/(sr-1.0)/Grav/SD50
+      Shields = sqrt(Shields_x**2+Shields_y**2)
+
+      ! Bed-load transport rate                     
+      if(Shields>Shields_c) then
+        Qbedx(i,j) = 11.0*(Shields-Shields_c)**1.65*Shields_x/Shields*  &
+                sqrt((sr-1)*Grav*SD50**3)
+        Qbedy(i,j) = 11.0*(Shields-Shields_c)**1.65*Shields_y/Shields*  &
+                sqrt((sr-1)*Grav*SD50**3)
+
+        if(x(i)<=1.0) then
+          Qbedx(i,j) = 0.0
+          Qbedy(i,j) = 0.0
+        endif
+      else
+        Qbedx(i,j) = Zero
+        Qbedy(i,j) = Zero
+      endif
+    enddo
+    enddo
+
+    call phi_2D_coll(Qbedx)
+    call phi_2D_coll(Qbedy)
+
+    end subroutine eval_bedload
+
+
+    subroutine update_bed(ISTEP)
+!-----------------------------------------------------------
+!   Update bed elevation 
+!   Called by 
+!      main
+!   Last update: 15/06/2012, Gangfeng Ma
+!-----------------------------------------------------------
+    use global
+    implicit none
+    integer, intent(in) :: ISTEP
+    integer :: i,j,I1,I2
+    real(SP) :: rsedi
+    character(len=2)  :: FILE_NAME
+    character(len=80) :: FDIR,file
+
+    if(ISTEP==2) then
+
+      Update_Bed_T = Update_Bed_T+dt
+
+      do j = Jbeg,Jend
+      do i = Ibeg,Iend
+        TotDep(i,j) = TotDep(i,j)+SSour(i,j)*Srho*dt
+      enddo
+      enddo
+
+!      ! assuming equilibrium beach profile
+!      ! sediment suspension is not considered
+!      do j = Jbeg,Jend
+!      do i = Ibeg,Iend
+!        Bed(i,j) = Bed(i,j)+dt*(-(Qbedx(i+1,j)-Qbedx(i-1,j))/(2.0*dx)-  &
+!            (Qbedy(i,j+1)-Qbedy(i,j-1))/(2.0*dy))/(1.0-Spor)
+!         Bed(i,j) = Bed(i,j)+dt*SSour(i,j)/(1.0-Spor)
+!      enddo
+!      enddo
+
+      ! output bed elevation
+      if(OUT_G.and.Update_Bed_T>=300.) then
+        nbed = nbed+1
+
+        FDIR = TRIM(RESULT_FOLDER)
+
+        I1 = mod(nbed/10,10)
+        I2 = mod(nbed,10)
+
+        write(FILE_NAME(1:1),'(I1)') I1
+        write(FILE_NAME(2:2),'(I1)') I2
+
+        file=TRIM(FDIR)//'depos_'//TRIM(FILE_NAME)
+        call putfile2D(file,TotDep)
+
+!        file=TRIM(FDIR)//'bed_'//TRIM(FILE_NAME)
+!        call putfile2D(file,Bed)
+
+        Update_Bed_T = 0.0
+      endif
+
+
+      ! update water depth
+!      do j = Jbeg,Jend
+!      do i = Ibeg,Iend 
+!        Hc(i,j) = Hc0(i,j)-Bed(i,j)
+!      enddo
+!      enddo             
+!            
+!      call phi_2D_coll(Hc)  
+!
+!      ! reconstruct depth at x-y faces 
+!      do j = 1,Nloc 
+!      do i = 2,Mloc
+!        Hfx(i,j) = 0.5*(Hc(i,j)+Hc(i+1,j)) 
+!      enddo 
+!      Hfx(1,j) = Hfx(2,j)
+!      Hfx(Mloc1,j) = Hfx(Mloc,j) 
+!      enddo 
+!
+!      do i = 1,Mloc 
+!      do j = 2,Nloc 
+!        Hfy(i,j) = 0.5*(Hc(i,j)+Hc(i,j+1))  
+!      enddo
+!      Hfy(i,1) = Hfy(i,2) 
+!      Hfy(i,Nloc1) = Hfy(i,Nloc) 
+!      enddo
+!
+!      ! derivatives of water depth at cell center 
+!      do j = 1,Nloc 
+!      do i = 1,Mloc
+!        DelxH(i,j) = (Hfx(i+1,j)-Hfx(i,j))/dx 
+!        DelyH(i,j) = (Hfy(i,j+1)-Hfy(i,j))/dy 
+!      enddo 
+!      enddo
+    endif
+
+    return
+    end subroutine update_bed
+# endif
+
+
+# if defined (SALINITY)
+    subroutine eval_sali(ISTEP)
+!---------------------------------------------------------------------
+!   Update sediment concentration
+!   Last update: Gangfeng Ma, 09/01/2011
+!---------------------------------------------------------------------
+    use global
+    implicit none
+    integer, intent(in) :: ISTEP
+    real(SP), dimension(:,:,:), allocatable :: R5,DUfs,DVfs,Wfs
+    real(SP), dimension(:), allocatable :: Acoef,Bcoef,Ccoef,Xsol,Rhs0
+    real(SP) :: SchC
+    integer :: i,j,k,IVAR,Nlen
+
+    allocate(R5(Mloc,Nloc,Kloc))
+    allocate(DUfs(Mloc1,Nloc,Kloc))
+    allocate(DVfs(Mloc,Nloc1,Kloc))
+    allocate(Wfs(Mloc,Nloc,Kloc1))
+
+    Nlen = Kend-Kbeg+1
+    allocate(Acoef(Nlen))
+    allocate(Bcoef(Nlen))
+    allocate(Ccoef(Nlen))
+    allocate(Xsol(Nlen))
+    allocate(Rhs0(Nlen))
+
+    DUfs = Ex
+    DVfs = Ey
+    Wfs = Omega
+
+    ! advection and diffusion 
+    IVAR = 3 
+    call adv_scalar_hlpa(DUfs,DVfs,Wfs,Sali,R5,IVAR)
+
+    if(VISCOUS_FLOW) then
+      SchC = 1.0
+      do i = Ibeg,Iend
+      do j = Jbeg,Jend
+        if(Mask(i,j)==0) cycle
+
+        Nlen = 0
+        do k = Kbeg,Kend
+          Nlen = Nlen+1
+          if(k==Kbeg) then
+            Acoef(Nlen) = 0.0
+          else
+            Acoef(Nlen) = -dt/D(i,j)**2*(0.5*(Cmu(i,j,k-1)+Cmu(i,j,k))+  &
+                 0.5*(CmuVt(i,j,k-1)+CmuVt(i,j,k))/SchC)/(0.5*dsig(k)*(dsig(k)+dsig(k-1)))
+          endif
+
+          if(k==Kend) then
+            Ccoef(Nlen) = 0.0
+          else
+            Ccoef(Nlen) = -dt/D(i,j)**2*(0.5*(Cmu(i,j,k)+Cmu(i,j,k+1))+  &
+                 0.5*(CmuVt(i,j,k)+CmuVt(i,j,k+1))/SchC)/(0.5*dsig(k)*(dsig(k)+dsig(k+1)))
+          endif
+        
+          Bcoef(Nlen) = 1.0-Acoef(Nlen)-Ccoef(Nlen)
+
+          Rhs0(Nlen) = DSali(i,j,k)+dt*R5(i,j,k)
+        enddo
+      
+        call trig(Acoef,Bcoef,Ccoef,Rhs0,Xsol,Nlen)
+
+        Nlen = 0
+        do k = Kbeg,Kend
+          Nlen = Nlen+1
+          DSali(i,j,k) = Xsol(Nlen)
+        enddo
+      enddo
+      enddo
+
+      ! update salinity
+      do k = Kbeg,Kend
+      do j = Jbeg,Jend
+      do i = Ibeg,Iend
+        DSali(i,j,k) = ALPHA(ISTEP)*DSali0(i,j,k)+BETA(ISTEP)*DSali(i,j,k)
+        if(Mask(i,j)==0) DSali(i,j,k) = Zero
+      enddo
+      enddo
+      enddo
+    else
+      ! update salinity
+      do k = Kbeg,Kend
+      do j = Jbeg,Jend
+      do i = Ibeg,Iend
+        DSali(i,j,k) = ALPHA(ISTEP)*DSali0(i,j,k)+BETA(ISTEP)*(DSali(i,j,k)+dt*R5(i,j,k))
+        if(Mask(i,j)==0) DSali(i,j,k) = Zero
+      enddo
+      enddo
+      enddo
+    endif
+
+    ! update Salinity 
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      Sali(i,j,k) = DSali(i,j,k)/D(i,j)
+    enddo
+    enddo
+    enddo
+
+    ! boundary condition and ghost cells
+    call sali_bc
+# if defined (PARALLEL)
+    call phi_3D_exch(Sali)
+# endif          
+
+    deallocate(R5)
+    deallocate(DUfs)
+    deallocate(DVfs)
+    deallocate(Wfs)
+    deallocate(Acoef)
+    deallocate(Bcoef)
+    deallocate(Ccoef)
+    deallocate(Xsol)
+    deallocate(Rhs0)
+
+    return
+    end subroutine eval_sali
+
+    subroutine sali_bc
+!-------------------------------------------------------------------
+!
+!   Boundary conditions for salinity
+!
+!------------------------------------------------------------------
+    use global
+    implicit none
+    integer :: i,j,k
+
+# if defined (PARALLEL)
+    if(n_west.eq.MPI_PROC_NULL) then
+# endif
+    do j = Jbeg,Jend
+    do k = Kbeg,Kend
+      do i = 1,Nghost
+        if(Bc_X0==1.or.Bc_X0==2) then
+          Sali(Ibeg-i,j,k) = Sali(Ibeg+i-1,j,k)
+        elseif(Bc_X0==3) then
+          Sali(Ibeg-i,j,k) = 2.0*Sin_X0(j,k)-Sali(Ibeg+i-1,j,k)
+        elseif(Bc_X0==4) then
+          Sali(Ibeg-i,j,k) = Sali(Ibeg+i-1,j,k)
+        elseif(Bc_X0==8) then
+          Sali(Ibeg-i,j,k) = Sin_X0(j,k)
+        endif
+      enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_east.eq.MPI_PROC_NULL) then
+# endif
+    do j = Jbeg,Jend
+    do k = Kbeg,Kend
+      do i = 1,Nghost
+        if(Bc_Xn==1.or.Bc_Xn==2) then
+          Sali(Iend+i,j,k) = Sali(Iend-i+1,j,k)
+        elseif(Bc_Xn==3) then
+          Sali(Iend+i,j,k) = 2.0*Sin_Xn(j,k)-Sali(Iend-i+1,j,k)
+        elseif(Bc_Xn==4) then
+          Sali(Iend+i,j,k) = Sali(Iend-i+1,j,k)
+        elseif(Bc_Xn==8) then
+          Sali(Iend+i,j,k) = Sin_Xn(j,k)
+        endif
+      enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_suth.eq.MPI_PROC_NULL) then
+# endif
+    do i = Ibeg,Iend
+    do k = Kbeg,Kend
+      do j = 1,Nghost
+        if(Bc_Y0==1.or.Bc_Y0==2) then
+          Sali(i,Jbeg-j,k) = Sali(i,Jbeg+j-1,k)
+        elseif(Bc_Y0==4) then
+          Sali(i,Jbeg-j,k) = Sali(i,Jbeg+j-1,k)
+        endif
+      enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif 
+
+# if defined (PARALLEL)
+    if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
+    do i = Ibeg,Iend
+    do k = Kbeg,Kend
+      do j = 1,Nghost
+        if(Bc_Yn==1.or.Bc_Yn==2) then
+          Sali(i,Jend+j,k) = Sali(i,Jend-j+1,k)
+        elseif(Bc_Yn==4) then
+          Sali(i,Jend+j,k) = Sali(i,Jend-j+1,k)
+        endif
+      enddo
+    enddo
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+    do i = Ibeg,Iend
+    do j = Jbeg,Jend
+      do k = 1,Nghost
+        Sali(i,j,Kbeg-k) = Sali(i,j,Kbeg+k-1)
+      enddo
+      do k = 1,Nghost
+        Sali(i,j,Kend+k) = Sali(i,j,Kend-k+1)
+      enddo
+    enddo
+    enddo
+
+    end subroutine sali_bc
+# endif
 
     subroutine eval_dens
 !---------------------------------------------------------------------
@@ -8184,8 +11480,10 @@
     integer,dimension(1) :: req
     real(SP),dimension(:,:),allocatable :: xx,rhozloc
     real(SP),dimension(Mglob,Nglob,kbbm1) :: rhozglob
+# if defined (PARALLEL)
     integer,dimension(MPI_STATUS_SIZE,1) :: status
     integer,dimension(NumP) :: npxs,npys
+# endif
     real(SP) :: DELTZ,TF,SF,RHOF,HMAX,ETAMAX
     real(SP) :: tmp1,tmp2,myvar
     integer :: I,J,K,isum,jk,iglob,jglob,kk,n,len,nreq,NKloc
@@ -8195,7 +11493,23 @@
     DO J = 1,NLOC
     DO I = 1,MLOC
       IF(Mask(I,J)==0) cycle
+# if defined (SALINITY)
+      TF = Temp(I,J,K)
+      SF = Sali(I,J,K)
+      RHOF = SF*SF*SF*6.76786136E-6_SP-SF*SF*4.8249614E-4_SP+ &
+           SF*8.14876577E-1_SP-0.22584586E0_SP
+      RHOF = RHOF*(TF*TF*TF*1.667E-8_SP-TF*TF*8.164E-7_SP+ &
+           TF*1.803E-5_SP)
+      RHOF = RHOF+1.-TF*TF*TF*1.0843E-6_SP+TF*TF*9.8185E-5_SP-TF*4.786E-3_SP
+      RHOF = RHOF*(SF*SF*SF*6.76786136E-6_SP-SF*SF*4.8249614E-4_SP+  &
+           SF*8.14876577E-1_SP+3.895414E-2_SP)
+      RHOF = RHOF-(TF-3.98_SP)**2*(TF+283.0_SP)/(503.57_SP*(TF+67.26_SP))
+      Rho(I,J,K) = Rho0+RHOF
+# endif
 
+# if defined (SEDIMENT)
+      Rho(I,J,K) = (1.0-Conc(i,j,k))*Rho0+Conc(i,j,k)*SRho
+# endif
     ENDDO
     ENDDO
     ENDDO
@@ -8210,10 +11524,12 @@
       if(eta(i,j)>tmp2) tmp2 = Eta(i,j)
     enddo
     enddo
+# if defined (PARALLEL)
     call MPI_ALLREDUCE(tmp1,myvar,1,MPI_SP,MPI_MAX,MPI_COMM_WORLD,ier)
     hmax = myvar
     call MPI_ALLREDUCE(tmp2,myvar,1,MPI_SP,MPI_MAX,MPI_COMM_WORLD,ier)
     etamax = myvar
+# endif
 
     ! interpolate into physical z levels
     deltz = (hmax+etamax)/float(kbbm1)
@@ -8239,6 +11555,7 @@
     enddo
     enddo
 
+# if defined (PARALLEL)
     call MPI_GATHER(npx,1,MPI_INTEGER,npxs,1,MPI_INTEGER,  &
            0,MPI_COMM_WORLD,ier)
     call MPI_GATHER(npy,1,MPI_INTEGER,npys,1,MPI_INTEGER,  &
@@ -8320,6 +11637,27 @@
 
     call MPI_BCAST(rhomean,kbbm1,MPI_SP,0,MPI_COMM_WORLD,ier)
 
+# else
+
+    rhomean = zero
+    do k = 1,kbbm1
+      isum = 0
+      do j = Jbeg,Jend
+      do i = Ibeg,Iend
+        if(-Hc(i,j)<=phy_z(k)) then
+          isum = isum+1
+          rhomean(k) = rhomean(k)+rhoz(i,j,k)
+        endif
+      enddo
+      enddo
+      if(isum>=1) then
+        rhomean(k) = rhomean(k)/float(isum)
+      else
+        rhomean(k) = rhomean(k-1)
+      endif
+    enddo
+
+# endif
 
     ! linearly interpolate to obtain density at signa levels
     Rmean = Rho0
@@ -8621,6 +11959,1243 @@
     end subroutine trig
 
 
+# if defined (VEGETATION)
+    subroutine veg_height(load)
+    use global
+    implicit none
+    real(SP), dimension(Mloc,Nloc), intent(in) :: load
+    integer :: i,j
+
+    ! estimate height of flexible vegetation (Li and Xie, AWR, 2011)
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(load(i,j)<=100.) then
+        FVegH(i,j) = -1.1093e-12*load(i,j)**6-7.9352e-12*load(i,j)**5  &
+                     +7.3301e-8*load(i,j)**4-1.2141e-5*load(i,j)**3  &
+                     +8.5414e-4*load(i,j)**2-3.171e-2*load(i,j)+1.0143
+      else
+        FVegH(i,j) = 5.4583e-18*load(i,j)**6-1.9598e-14*load(i,j)**5  &
+                     +2.8577e-11*load(i,j)**4-2.1897e-8*load(i,j)**3  &
+                     +9.5802e-6*load(i,j)**2-2.5010e-3*load(i,j)+0.55942
+      endif
+    enddo
+    enddo
+    FVegH = FVegH*VegH
+
+    return
+    end subroutine veg_height
+
+    subroutine foli(load)
+    use global
+    implicit none
+    real(SP), dimension(Mloc,Nloc), intent(in) :: load
+    integer :: i,j
+
+    ! estimate foliage effects of flexible vegetation (Li and Xie, AWR, 2011)    
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(load(i,j)<=100.) then
+        Foliage(i,j) = 8.6842e-12*load(i,j)**6-3.5010e-9*load(i,j)**5  &
+                     +5.6891e-7*load(i,j)**4-4.7779e-5*load(i,j)**3  &
+                     +2.2195e-3*load(i,j)**2-5.7707e-2*load(i,j)+1.0255
+      else
+        Foliage(i,j) = 9.0840e-13*load(i,j)**4-2.3969e-9*load(i,j)**3  &
+                     +2.3272e-6*load(i,j)**2-1.056e-3*load(i,j)+0.31984 
+      endif
+    enddo
+    enddo
+
+    return
+    end subroutine foli
+# endif
+
+# if defined (OBSTACLE)
+    subroutine set_obsvel
+!---------------------------------------------------------------
+!   Specify or calculate obstacle velocities
+!   by Gangfeng Ma, 17/08/2013
+!---------------------------------------------------------------
+    use global, only: Zero,obs_u,obs_v,obs_w
+    implicit none
+
+    obs_u = Zero
+    obs_v = Zero
+    obs_w = Zero
+
+    return
+    end subroutine set_obsvel
+
+    subroutine set_obsflag
+!----------------------------------------------------------------
+!   Determine obstacle flag
+!   set_flag = 1: fluid
+!   set_flag = 0: obstacle
+!----------------------------------------------------------------
+    use global, only: SP,Mloc,Nloc,Kloc,Ibeg,Iend,Jbeg,Jend,Kbeg,Kend, &
+                      xc,yc,set_flag,set_dist_x,set_dist_y,set_dist_z, &
+                      D,sigc
+    implicit none
+    integer :: i,j,k
+    real(SP) :: zc,xlin,ylin,zlin
+
+    ! default is fluid
+    set_flag = 0
+
+    ! specify obstacle 
+    do k = 1,Kloc
+    do j = 1,Nloc
+    do i = 1,Mloc
+      zc = D(i,j)*sigc(k)
+
+      ! obstacle 1
+      if(xc(i)>=6.0.and.xc(i)<=12.0) then
+        if(zc<0.05*(xc(i)-6.0)) set_flag(i,j,k) = 1
+      endif
+
+      ! obstacle 2
+      if(xc(i)>=12.0.and.xc(i)<=14.0) then
+        if(zc<0.3) set_flag(i,j,k) = 1
+      endif
+
+      ! obstacle 3
+      if(xc(i)>=14.0.and.xc(i)<=17.0) then
+        if(zc<0.1*(17.0-xc(i))) set_flag(i,j,k) = 1
+      endif
+    enddo
+    enddo
+    enddo
+
+    ! distance from obstacle/fluid interface to neighboring fluid cell 
+    set_dist_x = 1.e+20
+    set_dist_y = 1.e+20
+    set_dist_z = 1.e+20
+
+    ! find the distance
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+
+      ! obstacle 1
+      if(xc(i)>=6.0.and.xc(i)<=12.0) then
+        ! loop over all fluid cells
+        if(set_flag(i,j,k)==0) then
+          ! obstacle on the right
+          if(set_flag(i+1,j,k)==1) then
+            zc = D(i,j)*sigc(k)   
+            xlin = 20.0*zc+6.0
+            set_dist_x(i,j,k) = abs(xlin-xc(i))
+          endif
+
+          ! obstacle under the fluid
+          if(set_flag(i,j,k-1)==1) then           
+            zc = D(i,j)*sigc(k)
+            zlin = 0.05*(xc(i)-6.0)
+            set_dist_z(i,j,k) = abs(zc-zlin)
+          endif
+        endif  
+      endif
+
+      ! obstacle 2
+      if(xc(i)>=12.0.and.xc(i)<=14.0) then
+        ! loop over all fluid cells
+        if(set_flag(i,j,k)==0) then
+          ! obstacle under the fluid
+          if(set_flag(i,j,k-1)==1) then
+            zc = D(i,j)*sigc(k)
+            set_dist_z(i,j,k) = abs(zc-0.3)
+          endif
+        endif
+      endif
+
+      ! obstacle 3
+      if(xc(i)>=14.0.and.xc(i)<=17.0) then
+        ! loop over all fluid cells
+        if(set_flag(i,j,k)==0) then
+          ! obstacle on the left
+          if(set_flag(i-1,j,k)==1) then
+            zc = D(i,j)*sigc(k)
+            xlin = 17.0-10.0*zc
+            set_dist_x(i,j,k) = abs(xc(i)-xlin)
+          endif
+
+          ! obstacle under the fluid
+          if(set_flag(i,j,k-1)==1) then
+            zc = D(i,j)*sigc(k)
+            zlin = 0.1*(17.0-xc(i))
+            set_dist_z(i,j,k) = abs(zc-zlin)
+          endif
+        endif
+      endif
+    enddo
+    enddo
+    enddo
+
+    return
+    end subroutine set_obsflag
+
+    subroutine imm_obs(RhsU,RhsV,RhsW)
+!---------------------------------------------------------------------
+!   Immersed-Boundary Method
+!   Calculate forcing at the obstacle boundary
+!   By Gangfeng Ma, 17/08/2013
+!--------------------------------------------------------------------
+    use global
+    implicit none
+    real(SP),dimension(Mloc,Nloc,Kloc),intent(in) :: RhsU,RhsV,RhsW
+    real(SP),dimension(:),allocatable :: target_vel,target_dist
+    integer :: i,j,k,l,count
+    real(SP) :: numer,denom,force_vel,dista,vel_grad
+
+    ! obstacle velocity
+    call set_obsvel
+
+    ! set obstacle flag
+    call set_obsflag
+
+    ! calculate forcing at boundaries
+    ObsForceX = Zero
+    ObsForceY = Zero
+    ObsForceZ = Zero
+
+    allocate(target_vel(1:6))
+    allocate(target_dist(1:6))
+
+    ! x-direction
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      ! for fluid cells
+      if(set_flag(i,j,k)==0) then
+        count = 0
+        target_vel = 0.0
+        target_dist = 0.0
+
+        ! i.e. (i,j,k) is fluid, (i-1,j,k) is obstacle
+        if(set_flag(i-1,j,k)==1.and.set_dist_x(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_x(i,j,k)
+          ! compute velocity gradient from (i+1,j,k) to obstacle/fluid interface
+          dista = dista+(xc(i+1)-xc(i))
+          vel_grad = (U(i+1,j,k)-obs_u)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-(xc(i+1)-xc(i))
+          target_vel(count) = obs_u+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i+1,j,k) is obstacle
+        if(set_flag(i+1,j,k)==1.and.set_dist_x(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k) 
+          dista = set_dist_x(i,j,k)
+          ! compute velocity gradient from (i-1,j,k) to obstacle/fluid interface  
+          dista = dista+(xc(i)-xc(i-1))
+          vel_grad = (obs_u-U(i-1,j,k))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-(xc(i)-xc(i-1))
+          target_vel(count) = obs_u-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j-1,k) is obstacle
+        if(Nloc>=2.and.set_flag(i,j-1,k)==1.and.set_dist_y(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_y(i,j,k)
+          ! compute velocity gradient from (i,j+1,k) to obstacle/fluid interface 
+          dista = dista+(yc(j+1)-yc(j))
+          vel_grad = (U(i,j+1,k)-obs_u)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k) 
+          dista = dista-(yc(j+1)-yc(j))
+          target_vel(count) = obs_u+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j+1,k) is obstacle 
+        if((Nloc>=2).and.set_flag(i,j+1,k)==1.and.set_dist_y(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_y(i,j,k)
+          ! compute velocity gradient from (i,j-1,k) to obstacle/fluid interface 
+          dista = dista+(yc(j)-yc(j-1))
+          vel_grad = (obs_u-U(i,j-1,k))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-(yc(j)-yc(j-1))
+          target_vel(count) = obs_u-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j,k-1) is obstacle
+        if(set_flag(i,j,k-1)==1.and.set_dist_z(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k) -- (adjust according to obstacle)
+          dista = set_dist_z(i,j,k)
+          ! compute velocity gradient from (i,j,k+1) to obstacle/fluid interface 
+          dista = dista+D(i,j)*(sigc(k+1)-sigc(k))
+          vel_grad = (U(i,j,k+1)-obs_u)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-D(i,j)*(sigc(k+1)-sigc(k))
+          target_vel(count) = obs_u+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j,k+1) is obstacle 
+        if(set_flag(i,j,k+1)==1.and.set_dist_z(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_z(i,j,k)
+          ! compute velocity gradient from (i,j,k-1) to obstacle/fluid interface 
+          dista = dista+D(i,j)*(sigc(k)-sigc(k-1))
+          vel_grad = (obs_u-U(i,j,k-1))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-D(i,j)*(sigc(k)-sigc(k-1))
+          target_vel(count) = obs_u-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! Search for target distances that are zero, to avoid divide-by-zero problems.
+        if(count>=1) then
+          numer = 0.0
+          denom = 0.0
+          do l = 1,count
+            if (target_dist(l)<1.e-16) then
+              force_vel = target_vel(l)
+              goto 1
+            else
+              numer = numer+target_vel(l)*1.0/target_dist(l)
+              denom = denom+1.0/target_dist(l)
+            endif
+          enddo
+          force_vel = numer/denom
+ 1        continue
+          ObsForceX(i,j,k) = -RhsU(i,j,k)+(D(i,j)*force_vel-DU(i,j,k))/dt
+        endif
+      endif
+    enddo
+    enddo
+    enddo
+
+    ! y-direction
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      ! for fluid cells
+      if(set_flag(i,j,k)==0) then
+        count = 0
+        target_vel = 0.0
+        target_dist = 0.0
+
+        ! i.e. (i,j,k) is fluid, (i-1,j,k) is obstacle
+        if(set_flag(i-1,j,k)==1.and.set_dist_x(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_x(i,j,k)
+          ! compute velocity gradient from (i+1,j,k) to obstacle/fluid interface
+          dista = dista+(xc(i+1)-xc(i))
+          vel_grad = (V(i+1,j,k)-obs_v)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-(xc(i+1)-xc(i))
+          target_vel(count) = obs_v+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i+1,j,k) is obstacle
+        if(set_flag(i+1,j,k)==1.and.set_dist_x(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k) 
+          dista = set_dist_x(i,j,k)
+          ! compute velocity gradient from (i-1,j,k) to obstacle/fluid interface  
+          dista = dista+(xc(i)-xc(i-1))
+          vel_grad = (obs_v-V(i-1,j,k))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)                                                                              
+          dista = dista-(xc(i)-xc(i-1))
+          target_vel(count) = obs_v-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j-1,k) is obstacle
+        if(Nloc>=2.and.set_flag(i,j-1,k)==1.and.set_dist_y(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_y(i,j,k)
+          ! compute velocity gradient from (i,j+1,k) to obstacle/fluid interface 
+          dista = dista+(yc(j+1)-yc(j))
+          vel_grad = (V(i,j+1,k)-obs_v)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k) 
+          dista = dista-(yc(j+1)-yc(j))
+          target_vel(count) = obs_v+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j+1,k) is obstacle 
+        if((Nloc>=2).and.set_flag(i,j+1,k)==1.and.set_dist_y(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_y(i,j,k)
+          ! compute velocity gradient from (i,j-1,k) to obstacle/fluid interface 
+          dista = dista+(yc(j)-yc(j-1))
+          vel_grad = (obs_v-V(i,j-1,k))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-(yc(j)-yc(j-1))
+          target_vel(count) = obs_v-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j,k-1) is obstacle
+        if(set_flag(i,j,k-1)==1.and.set_dist_z(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k) -- (adjust according to obstacle)
+          dista = set_dist_z(i,j,k)
+          ! compute velocity gradient from (i,j,k+1) to obstacle/fluid interface 
+          dista = dista+D(i,j)*(sigc(k+1)-sigc(k))
+          vel_grad = (V(i,j,k+1)-obs_v)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-D(i,j)*(sigc(k+1)-sigc(k))
+          target_vel(count) = obs_v+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j,k+1) is obstacle 
+        if(set_flag(i,j,k+1)==1.and.set_dist_z(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_z(i,j,k)
+          ! compute velocity gradient from (i,j,k-1) to obstacle/fluid interface 
+          dista = dista+D(i,j)*(sigc(k)-sigc(k-1))
+          vel_grad = (obs_v-V(i,j,k-1))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-D(i,j)*(sigc(k)-sigc(k-1))
+          target_vel(count) = obs_v-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! Search for target distances that are zero, to avoid divide-by-zero problems.
+        if(count>=1) then
+          numer = 0.0
+          denom = 0.0
+          do l = 1,count
+            if (target_dist(l)<1.e-16) then
+              force_vel = target_vel(l)
+              goto 2
+            else
+              numer = numer+target_vel(l)*1.0/target_dist(l)
+              denom = denom+1.0/target_dist(l)
+            endif
+          enddo
+          force_vel = numer/denom
+ 2        continue
+          ObsForceY(i,j,k) = -RhsV(i,j,k)+(D(i,j)*force_vel-DV(i,j,k))/dt
+        endif
+      endif
+    enddo
+    enddo
+    enddo
+ 
+    ! z-direction
+    do k = Kbeg,Kend
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      ! for fluid cells
+      if(set_flag(i,j,k)==0) then
+        count = 0
+        target_vel = 0.0
+        target_dist = 0.0
+
+        ! i.e. (i,j,k) is fluid, (i-1,j,k) is obstacle
+        if(set_flag(i-1,j,k)==1.and.set_dist_x(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_x(i,j,k)
+          ! compute velocity gradient from (i+1,j,k) to obstacle/fluid interface
+          dista = dista+(xc(i+1)-xc(i))
+          vel_grad = (W(i+1,j,k)-obs_w)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-(xc(i+1)-xc(i))
+          target_vel(count) = obs_w+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i+1,j,k) is obstacle
+        if(set_flag(i+1,j,k)==1.and.set_dist_x(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k) 
+          dista = set_dist_x(i,j,k)
+          ! compute velocity gradient from (i-1,j,k) to obstacle/fluid interface  
+          dista = dista+(xc(i)-xc(i-1))
+          vel_grad = (obs_w-W(i-1,j,k))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)                                                                              
+          dista = dista-(xc(i)-xc(i-1))
+          target_vel(count) = obs_w-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j-1,k) is obstacle
+        if(Nloc>=2.and.set_flag(i,j-1,k)==1.and.set_dist_y(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_y(i,j,k)
+          ! compute velocity gradient from (i,j+1,k) to obstacle/fluid interface 
+          dista = dista+(yc(j+1)-yc(j))
+          vel_grad = (W(i,j+1,k)-obs_w)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k) 
+          dista = dista-(yc(j+1)-yc(j))
+          target_vel(count) = obs_w+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j+1,k) is obstacle 
+        if((Nloc>=2).and.set_flag(i,j+1,k)==1.and.set_dist_y(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_y(i,j,k)
+          ! compute velocity gradient from (i,j-1,k) to obstacle/fluid interface 
+          dista = dista+(yc(j)-yc(j-1))
+          vel_grad = (obs_w-W(i,j-1,k))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-(yc(j)-yc(j-1))
+          target_vel(count) = obs_w-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j,k-1) is obstacle
+        if(set_flag(i,j,k-1)==1.and.set_dist_z(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k) -- (adjust according to obstacle)
+          dista = set_dist_z(i,j,k)
+          ! compute velocity gradient from (i,j,k+1) to obstacle/fluid interface 
+          dista = dista+D(i,j)*(sigc(k+1)-sigc(k))
+          vel_grad = (W(i,j,k+1)-obs_w)/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-D(i,j)*(sigc(k+1)-sigc(k))
+          target_vel(count) = obs_w+vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! i.e. (i,j,k) is fluid, (i,j,k+1) is obstacle 
+        if(set_flag(i,j,k+1)==1.and.set_dist_z(i,j,k)<1.e+10) then
+          count = count+1
+          ! Determine distance of interface to point (i,j,k)
+          dista = set_dist_z(i,j,k)
+          ! compute velocity gradient from (i,j,k-1) to obstacle/fluid interface 
+          dista = dista+D(i,j)*(sigc(k)-sigc(k-1))
+          vel_grad = (obs_w-W(i,j,k-1))/dista
+          ! interpolate velocity from obstacle/fluid interface to (i,j,k)
+          dista = dista-D(i,j)*(sigc(k)-sigc(k-1))
+          target_vel(count) = obs_w-vel_grad*dista
+          target_dist(count) = dista
+        endif
+
+        ! Search for target distances that are zero, to avoid divide-by-zero problems.
+        if(count>=1) then
+          numer = 0.0
+          denom = 0.0
+          do l = 1,count
+            if (target_dist(l)<1.e-16) then
+              force_vel = target_vel(l)
+              goto 3
+            else
+              numer = numer+target_vel(l)*1.0/target_dist(l)
+              denom = denom+1.0/target_dist(l)
+            endif
+          enddo
+          force_vel = numer/denom
+ 3        continue
+          ObsForceZ(i,j,k) = -RhsW(i,j,k)+(D(i,j)*force_vel-DW(i,j,k))/dt
+        endif
+      endif
+    enddo
+    enddo
+    enddo
+
+    deallocate(target_vel)
+    deallocate(target_dist)
+ 1000 continue
+
+    return
+    end subroutine imm_obs
+# endif
+
+# if defined (TWOLAYERSLIDE)
+!---------------------------------------------------------------------------------------
+!   The following subroutines are designed for granular flow landslide.
+!   Update: Gangfeng Ma, Oct.15, 2013
+!---------------------------------------------------------------------------------------
+    subroutine source_terms_ll
+    use global
+    implicit none
+    integer :: i,j,k
+    real(SP) :: sinx,siny,sdens,vfluid,CosX,CosY,Dudy,Dvdx,Umag,Lambda,Ubar,Vbar
+    real(SP), dimension(:,:), allocatable :: Delx2P,Dely2P,Pbot
+    real(SP) :: tanbeta,cosbeta,Sxy
+
+    allocate(Pbot(Mloc,Nloc))
+    allocate(Delx2P(Mloc,Nloc))
+    allocate(Dely2P(Mloc,Nloc))
+
+    SorceaX = Zero
+    SorceaY = Zero
+
+    ! source terms for lower layer                                                                       
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0) cycle
+      sinx = (Hc0(i+1,j)-Hc0(i-1,j))/sqrt((xc(i+1)-xc(i-1))**2+(Hc0(i+1,j)-Hc0(i-1,j))**2) 
+      siny = (Hc0(i,j+1)-Hc0(i,j-1))/sqrt((yc(j+1)-yc(j-1))**2+(Hc0(i,j+1)-Hc0(i,j-1))**2)            
+
+      SorceaX(i,j) = Grav*Ha(i,j)*sinx
+      SorceaY(i,j) = Grav*Ha(i,j)*siny
+    enddo
+    enddo
+
+    ! contributions from fluid stresses
+    ForceX_UL = 0.0; ForceY_UL = 0.0
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0.or.Mask(i,j)==0) cycle
+      Umag = sqrt((Ua(i,j)-U(i,j,Kbeg))**2+(Va(i,j)-V(i,j,Kbeg))**2)
+      ForceX_UL(i,j) = 0.5*Cf_ul*Umag*(Ua(i,j)-U(i,j,Kbeg))
+      ForceY_UL(i,j) = 0.5*Cf_ul*Umag*(Va(i,j)-V(i,j,Kbeg))
+      SorceaX(i,j) = SorceaX(i,j)-ForceX_UL(i,j)
+      SorceaY(i,j) = SorceaY(i,j)-ForceY_UL(i,j)
+    enddo
+    enddo
+
+    ! contributions from solid stresses                                                              
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0) cycle
+      
+      if(Mask(i,j)==1) then
+        Lambda = SlideLambda
+      else
+        Lambda = 0.0
+      endif
+
+      Umag = sqrt(Ua(i,j)**2+Va(i,j)**2)
+      SorceaX(i,j) = SorceaX(i,j)-(1.0-Lambda)*Grav*CosAng(i,j)*Ha(i,j)*  &
+                       tan(PhiBed)*Ua(i,j)/(Umag+1.e-16)
+      SorceaY(i,j) = SorceaY(i,j)-(1.0-Lambda)*Grav*CosAng(i,j)*Ha(i,j)*  &
+                       tan(PhiBed)*Va(i,j)/(Umag+1.e-16)
+
+      Sxy = 0.5*(DelyUa(i,j)+DelxVa(i,j))
+      if(Sxy.ne.0.0) then
+        SorceaX(i,j) = SorceaX(i,j)-sign(1.0,Sxy)*  &                                                                               
+                       (1.0-Lambda)*Grav*CosAng(i,j)*Ha(i,j)*Kap(i,j)*DelyHa(i,j)*sin(PhiInt)
+        SorceaY(i,j) = SorceaY(i,j)-sign(1.0,Sxy)*  &                                                                               
+                       (1.0-Lambda)*Grav*CosAng(i,j)*Ha(i,j)*Kap(i,j)*DelxHa(i,j)*sin(PhiInt)
+      endif
+    enddo
+    enddo
+
+    k = Kbeg
+    do j = 1,Nloc
+    do i = 1,Mloc
+      Pbot(i,j) = P(i,j,k)
+    enddo
+    enddo
+
+    Delx2P = Zero; Dely2P = Zero
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      Delx2P(i,j) = (Pbot(i+1,j)-Pbot(i-1,j))/(2.0*dx)
+      Dely2P(i,j) = (Pbot(i,j+1)-Pbot(i,j-1))/(2.0*dy)
+    enddo
+    enddo
+
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0.or.Mask(i,j)==0) cycle
+      SorceaX(i,j) = SorceaX(i,j)-Rho0/SlideDens*Grav*Ha(i,j)*(DelxH(i,j)+DelxEta(i,j))*CosAng(i,j)  &
+                          -Ha(i,j)/SlideDens*Delx2P(i,j)*CosAng(i,j)
+      SorceaY(i,j) = SorceaY(i,j)-Rho0/SlideDens*Grav*Ha(i,j)*(DelyH(i,j)+DelyEta(i,j))  &
+                          -Ha(i,j)/SlideDens*Dely2P(i,j)                     
+    enddo
+    enddo
+
+    deallocate(Pbot)
+    deallocate(Delx2P)
+    deallocate(Dely2P)
+
+    end subroutine source_terms_ll
 
 
+    subroutine convert_Ha_to_Hs
+!-------------------------------------------------------
+!   Convert the height of landslide in slope-oriented 
+!   coordinate (Ha) to Cartesian coordinate (Hs)
+!-------------------------------------------------------
+    use global
+    implicit none
+    integer :: i,j,i1,ic
+    real(SP) :: SlopeAng,SearchAng
+
+    ! initial values
+    Hs = Ha
+
+    ! conversion depending on SlopeAng
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0) cycle
+
+      if(Ha(i,j)<0.01) then
+        Hs(i,j) = Ha(i,j)
+      else
+
+      SlopeAng = (Hc0(i+1,j)-Hc0(i-1,j))/(2.0*dx)
+      ! no conversion if slope is too small
+      SearchAng = 0.0
+      if(SlopeAng>1.e-6) then  
+        ! find the location of vertical height Hs
+        ic = 1
+        do i1 = 1,20  ! search ten grids
+          if(Maska(i-i1,j)==1) then
+            SearchAng = float(i1)*dx/cos(atan(SlopeAng))/Ha(i-i1,j)
+            if(SearchAng>=SlopeAng) then
+              ic = i1
+              exit
+            endif
+          endif   
+        enddo
+        if(Maska(i-1,j)==0) then
+          Hs(i,j) = Ha(i,j)
+        else
+          Hs(i,j) = 0.5*(Ha(i-ic,j)+Ha(i-ic+1,j))/cos(atan(SlopeAng))
+        endif
+      elseif(SlopeAng<-1.e-6) then
+        ic = 1
+        do i1 = 1,20
+          if(Maska(i+i1,j)==1) then
+            SearchAng = float(i1)*dx/cos(atan(abs(SlopeAng)))/Ha(i+i1,j)
+            if(SearchAng>=SlopeAng) then
+              ic = i1
+              exit
+            endif
+          endif       
+        enddo
+        if(Maska(i+1,j)==0) then
+          Hs(i,j) = Ha(i,j)
+        else
+          Hs(i,j) = 0.5*(Ha(i+ic,j)+Ha(i+ic-1,j))/cos(atan(abs(SlopeAng)))
+        endif
+      else
+        Hs(i,j) = Ha(i,j)
+      endif
+      endif 
+    enddo
+    enddo   
+
+    end subroutine convert_Ha_to_Hs
+
+
+    subroutine update_hc_ul
+    use global
+    implicit none
+    integer :: i,j
+
+    ! save old bathymetry
+    Ho = Hc
+
+    ! convert Ha
+    call convert_Ha_to_Hs
+
+    ! update the thickness of the upper layer
+    do j = 1,Nloc
+    do i = 1,Mloc
+      if(Maska(i,j)==1) then
+        Hc(i,j) = Hc0(i,j)-Hs(i,j)
+      else
+        Hc(i,j) = Hc0(i,j)
+      endif
+    enddo
+    enddo
+
+    do j = 1,Nloc
+    do i = 1,Mloc
+      if(Mask(i,j)==0) then
+        Eta(i,j) = MinDep-Hc(i,j)
+        D(i,j) = Eta(i,j)+Hc(i,j)
+      endif
+    enddo
+    enddo
+
+    ! reconstruct depth at x-y faces
+    do j = 1,Nloc
+    do i = 2,Mloc
+      Hfx(i,j) = 0.5*(Hc(i,j)+Hc(i-1,j))
+    enddo
+    Hfx(1,j) = Hfx(2,j)
+    Hfx(Mloc1,j) = Hfx(Mloc,j)
+    enddo
+
+    do i = 1,Mloc
+    do j = 2,Nloc
+      Hfy(i,j) = 0.5*(Hc(i,j)+Hc(i,j-1))
+    enddo
+    Hfy(i,1) = Hfy(i,2)
+    Hfy(i,Nloc1) = Hfy(i,Nloc)
+    enddo
+
+    ! derivatives of water depth at cell center
+    do j = 1,Nloc
+    do i = 1,Mloc
+      DelxH(i,j) = (Hfx(i+1,j)-Hfx(i,j))/dx
+      DelyH(i,j) = (Hfy(i,j+1)-Hfy(i,j))/dy
+    enddo
+    enddo
+
+    ! time derivative of water depth
+    DeltHo = DeltH
+
+    DeltH = zero
+    do j = 1,Nloc
+    do i = 1,Mloc
+      if(Mask(i,j)==1) then
+        DeltH(i,j) = (Hc(i,j)-Ho(i,j))/dt
+      endif
+    enddo
+    enddo
+
+    ! second-order time derivative
+    if(RUN_STEP>2) Delt2H = (DeltH-DeltHo)/dt
+
+    end subroutine update_hc_ul
+
+
+    subroutine update_maska
+    use global
+    implicit none
+    integer :: i,j
+
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0) then
+        if(Maska(i-1,j)==1.and.Ha(i-1,j)>Ha(i,j)) Maska(i,j)=1
+        if(Maska(i+1,j)==1.and.Ha(i+1,j)>Ha(i,j)) Maska(i,j)=1
+        if(Maska(i,j-1)==1.and.Ha(i,j-1)>Ha(i,j)) Maska(i,j)=1
+        if(Maska(i,j+1)==1.and.Ha(i,j+1)>Ha(i,j)) Maska(i,j)=1
+      else
+        ! drying (wet->dry)               
+        if(Ha(i,j)-0.001<=1.e-6) then
+          Maska(i,j) = 0
+          Ha(i,j) = 0.001
+        endif
+      endif
+    enddo
+    enddo
+
+# if defined (PARALLEL)
+     ! collect mask into ghost cells  
+     call phi_int_exch(Maska)
+# endif
+
+    end subroutine update_maska
+
+
+    subroutine fluxes_ll
+    use global
+    implicit none
+
+    ! calculate granular flow parameters
+    call calc_kap
+
+    ! second order construction
+    call delxyFun_ll
+    call construction_ll
+
+    ! calculate wave speed
+    call wave_speed_ll
+
+    ! calculate fluxes at faces
+    call fluxes_at_faces_HLL_ll
+
+    ! flux bc
+    call flux_bc_ll
+
+    end subroutine fluxes_ll
+
+
+    subroutine eval_huv_ll(ISTEP)
+    use global
+    implicit none
+    integer, intent(in) :: ISTEP
+    real(SP), dimension(:,:), allocatable :: R1,R2,R3 
+    integer :: i,j,imask
+    real(SP) :: Vslide
+    
+    allocate(R1(Mloc,Nloc))
+    allocate(R2(Mloc,Nloc))
+    allocate(R3(Mloc,Nloc))
+    
+    R1 = Zero
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0) cycle
+      R1(i,j) = -1.0/dx*(Eax(i+1,j)-Eax(i,j))*CosAng(i,j)-1.0/dy*(Eay(i,j+1)-Eay(i,j))
+      Ha(i,j) = ALPHA(ISTEP)*Ha0(i,j)+BETA(ISTEP)*(Ha(i,j)+dt*R1(i,j))
+    enddo
+    enddo
+
+    R2 = Zero
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0) cycle
+      R2(i,j) = -1.0/dx*(Fax(i+1,j)-Fax(i,j))*CosAng(i,j)-1.0/dy*(Fay(i,j+1)-Fay(i,j))+SorceaX(i,j)
+      HUa(i,j) = ALPHA(ISTEP)*HUa0(i,j)+BETA(ISTEP)*(HUa(i,j)+dt*R2(i,j))
+    enddo
+    enddo
+
+    R3 = Zero
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0) cycle
+      R3(i,j) = -1.0/dx*(Gax(i+1,j)-Gax(i,j))*CosAng(i,j)-1.0/dy*(Gay(i,j+1)-Gay(i,j))+SorceaY(i,j)
+      HVa(i,j) = ALPHA(ISTEP)*HVa0(i,j)+BETA(ISTEP)*(HVa(i,j)+dt*R3(i,j))
+    enddo
+    enddo
+
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==1) then
+        Ua(i,j) = HUa(i,j)/Ha(i,j)
+        Va(i,j) = HVa(i,j)/Ha(i,j)
+      else
+        Ua(i,j) = 0.0
+        Va(i,j) = 0.0
+        HUa(i,j) = 0.0
+        HVa(i,j) = 0.0
+      endif
+    enddo
+    enddo
+
+    ! simple bc   
+    call phi_2D_coll(Ha)       
+    call phi_2D_coll(Ua)
+    call phi_2D_coll(Va)
+    call phi_2D_coll(HUa)
+    call phi_2D_coll(HVa)
+
+    call update_maska
+
+!    do j = Jbeg,Jend
+!    do i = Ibeg,Iend
+!      if(Maska(i,j)==0) then
+!        if(Maska(i-1,j)==1) then
+!          Ua(i,j) = Ua(i-1,j)
+!          Va(i,j) = Va(i-1,j)
+!          HUa(i,j) = Ha(i,j)*Ua(i,j)
+!          HVa(i,j) = Ha(i,j)*Va(i,j)
+!        elseif(Maska(i+1,j)==1) then
+!          Ua(i,j) = Ua(i+1,j)
+!          Va(i,j) = Va(i+1,j)
+!          HUa(i,j) = Ha(i,j)*Ua(i,j)
+!          HVa(i,j) = Ha(i,j)*Va(i,j)
+!        elseif(Maska(i,j-1)==1) then
+!          Ua(i,j) = Ua(i,j-1)
+!          Va(i,j) = Va(i,j-1)
+!          HUa(i,j) = Ha(i,j)*Ua(i,j)
+!          HVa(i,j) = Ha(i,j)*Va(i,j)
+!        elseif(Maska(i,j+1)==1) then
+!          Ua(i,j) = Ua(i,j+1)
+!          Va(i,j) = Va(i,j+1)
+!          HUa(i,j) = Ha(i,j)*Ua(i,j)
+!          HVa(i,j) = Ha(i,j)*Va(i,j)
+!        endif
+!      endif
+!    enddo
+!    enddo
+
+    deallocate(R1)
+    deallocate(R2)
+    deallocate(R3)
+
+    return
+    end subroutine eval_huv_ll
+
+
+    subroutine flux_bc_ll
+    use global
+    implicit none
+    integer :: i,j
+    real(SP) :: CosAlpha
+
+    ! left and right side
+# if defined (PARALLEL)
+    if(n_west.eq.MPI_PROC_NULL) then
+# endif
+    do j = Jbeg,Jend
+      CosAlpha = 0.5*(CosAng(Ibeg,j)+CosAng(Ibeg-1,j))
+      Eax(Ibeg,j) = Zero
+      Fax(Ibeg,j) = 0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapxR(Ibeg,j)+SlideLambda)*HaxR(Ibeg,j)*HaxR(Ibeg,j)
+      Gax(Ibeg,j) = Zero
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_east.eq.MPI_PROC_NULL) then
+# endif
+    do j = Jbeg,Jend
+      CosAlpha = 0.5*(CosAng(Iend,j)+CosAng(Iend1,j))
+      Eax(Iend1,j) = Zero
+      Fax(Iend1,j) = 0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapxL(Iend1,j)+SlideLambda)*HaxL(Iend1,j)*HaxL(Iend1,j)
+      Gax(Iend1,j) = Zero
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_suth.eq.MPI_PROC_NULL) then
+# endif
+    do i = Ibeg,Iend
+      CosAlpha = 0.5*(CosAng(i,Jbeg)+CosAng(i,Jbeg-1))
+      Eay(i,Jbeg) = Zero
+      Fay(i,Jbeg) = Zero
+      Gay(i,Jbeg) = 0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapyR(i,Jbeg)+SlideLambda)*HayR(i,Jbeg)*HayR(i,Jbeg)
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+# if defined (PARALLEL)
+    if(n_nrth.eq.MPI_PROC_NULL) then
+# endif
+    do i = Ibeg,Iend
+      CosAlpha = 0.5*(CosAng(i,Jend)+CosAng(i,Jend1))
+      Eay(i,Jend1) = Zero
+      Fay(i,Jend1) = Zero
+      Gay(i,Jend1) = 0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapyL(i,Jend1)+SlideLambda)*HayL(i,Jend1)*HayL(i,Jend1)
+    enddo
+# if defined (PARALLEL)
+    endif
+# endif
+
+    do j = Jbeg-1,Jend+1
+    do i = Ibeg-1,Iend+1
+      if(Maska(i,j)==0) then
+        if(Maska(i-1,j)==1) then
+          Eax(i,j) = Zero
+          Fax(i,j) = 0.5*Grav*CosAng(i-1,j)*((1.0-SlideLambda)*Kap(i-1,j)+  &
+                     SlideLambda)*HaxL(i,j)*HaxL(i-1,j)
+          Gax(i,j) = Zero
+        elseif(Maska(i+1,j)==1) then
+          Eax(i+1,j) = Zero
+          Fax(i+1,j) = 0.5*Grav*CosAng(i+1,j)*((1.0-SlideLambda)*Kap(i+1,j)+  &
+                       SlideLambda)*HaxR(i+1,j)*HaxR(i+1,j)
+          Gax(i+1,j) = Zero
+        elseif(Maska(i,j-1)==1) then
+          Eay(i,j) = Zero
+          Fay(i,j) = Zero
+          Gay(i,j) = 0.5*Grav*CosAng(i,j-1)*((1.0-SlideLambda)*Kap(i,j-1)+  &
+                     SlideLambda)*HayL(i,j)*HayL(i,j)
+        elseif(Maska(i,j+1)==1) then
+          Eay(i,j+1) = Zero
+          Fay(i,j+1) = Zero
+          Gay(i,j+1) = 0.5*Grav*CosAng(i,j+1)*((1.0-SlideLambda)*Kap(i,j+1)+  &
+                       SlideLambda)*HayR(i,j+1)*HayR(i,j+1)
+        endif
+      endif
+    enddo
+    enddo
+
+    end subroutine flux_bc_ll
+
+
+    subroutine delxyFun_ll
+    use global
+    implicit none
+
+    call delxFun_2D(Ha,DelxHa)
+    call delxFun_2D(Ua,DelxUa)
+    call delxFun_2D(Va,DelxVa)
+    call delxFun_2D(HUa,DelxHUa)
+    call delxFun_2D(HVa,DelxHVa)
+    call delxFun_2D(Kap,DelxKap)
+
+    call delyFun_2D(Ha,DelyHa)
+    call delyFun_2D(Ua,DelyUa)
+    call delyFun_2D(Va,DelyVa)
+    call delyFun_2D(HUa,DelyHUa)
+    call delyFun_2D(HVa,DelyHVa)
+    call delyFun_2D(Kap,DelyKap)
+
+    end subroutine delxyFun_ll
+
+
+    subroutine calc_kap
+    use global
+    implicit none
+    integer :: i,j
+    real(SP) :: Div,Umag
+
+    call delxFun_2D(Ua,DelxUa)
+    call delyFun_2D(Va,DelyVa)
+
+    ! The Earth pressure coefficient depends on
+    ! the divergence of the flow.
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend
+      if(Maska(i,j)==0) cycle
+      Umag = sqrt(Ua(i,j)**2+Va(i,j)**2)
+      if(Umag>1.e-6) then
+        ! calculate divergence 
+        Div = DelxUa(i,j)+DelyVa(i,j)
+
+        if(Div>1.e-6) then
+          Kap(i,j) = 2.0*(1.0-sqrt(1.0-cos(PhiInt)**2*(1.0+tan(PhiBed)**2)))/cos(PhiInt)**2-1.0        
+        elseif(Div<-1.e-6) then
+          Kap(i,j) = 2.0*(1.0+sqrt(1.0-cos(PhiInt)**2*(1.0+tan(PhiBed)**2)))/cos(PhiInt)**2-1.0
+        else
+          Kap(i,j) = 1.0
+        endif
+      else
+        Kap(i,j) = 1.0
+      endif 
+    enddo
+    enddo
+    
+    call phi_2D_coll(Kap)
+
+    return
+    end subroutine calc_kap
+ 
+
+    subroutine construction_ll
+    use global
+    implicit none
+    integer :: i,j
+    real(SP) :: CosAlpha
+
+    call construct_2D_x(Ha,DelxHa,HaxL,HaxR)
+    call construct_2D_x(Ua,DelxUa,UaxL,UaxR)
+    call construct_2D_x(Va,DelxVa,VaxL,VaxR)
+    call construct_2D_x(HUa,DelxHUa,HUaxL,HUaxR)
+    call construct_2D_x(HVa,DelxHVa,HVaxL,HVaxR)
+    call construct_2D_x(Kap,DelxKap,KapxL,KapxR)
+
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend1
+      CosAlpha  = 0.5*(CosAng(i,j)+cosAng(i-1,j))
+      EaxL(i,j) = HUaxL(i,j)
+      EaxR(i,j) = HUaxR(i,j)
+      FaxL(i,j) = HUaxL(i,j)*UaxL(i,j)+0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapxL(i,j)+ &
+                  SlideLambda)*HaxL(i,j)*HaxL(i,j)
+      FaxR(i,j) = HUaxR(i,j)*UaxR(i,j)+0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapxR(i,j)+ &
+                  SlideLambda)*HaxR(i,j)*HaxR(i,j)
+      GaxL(i,j) = HaxL(i,j)*UaxL(i,j)*VaxL(i,j)
+      GaxR(i,j) = HaxR(i,j)*UaxR(i,j)*VaxR(i,j)
+    enddo
+    enddo
+
+    call construct_2D_y(Ha,DelyHa,HayL,HayR)
+    call construct_2D_y(Ua,DelyUa,UayL,UayR)
+    call construct_2D_y(Va,DelyVa,VayL,VayR)
+    call construct_2D_y(HUa,DelyHUa,HUayL,HUayR)
+    call construct_2D_y(HVa,DelyHVa,HVayL,HVayR)
+    call construct_2D_y(Kap,DelyKap,KapyL,KapyR)
+
+    do j = Jbeg,Jend1
+    do i = Ibeg,Iend
+      CosAlpha  = 0.5*(CosAng(i,j)+CosAng(i,j-1))
+      EayL(i,j) = HVayL(i,j)
+      EayR(i,j) = HVayR(i,j)
+      FayL(i,j) = HayL(i,j)*UayL(i,j)*VayL(i,j)
+      FayR(i,j) = HayR(i,j)*UayR(i,j)*VayR(i,j)
+      GayL(i,j) = HVayL(i,j)*VayL(i,j)+0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapyL(i,j)+ &
+                  SlideLambda)*HayL(i,j)*HayL(i,j)
+      GayR(i,j) = HVayR(i,j)*VayR(i,j)+0.5*Grav*CosAlpha*((1.0-SlideLambda)*KapyR(i,j)+ &
+                  SlideLambda)*HayR(i,j)*HayR(i,j)
+    enddo
+    enddo
+
+    end subroutine construction_ll    
+
+
+    subroutine wave_speed_ll
+    use global
+    implicit none
+    integer :: i,j
+    real(SP) :: CosAlpha,SQR_PHI_L,SQR_PHI_R,SQR_PHI_S,U_S
+
+    do j = Jbeg,Jend
+    do i = Ibeg,Iend1
+      CosAlpha = 0.5*(CosAng(i,j)+CosAng(i-1,j))
+      SQR_PHI_L = sqrt(Grav*CosAlpha*((1.0-SlideLambda)*KapxL(i,j)+ &
+                  SlideLambda)*abs(HaxL(i,j)))
+      SQR_PHI_R = sqrt(Grav*CosAlpha*((1.0-SlideLambda)*KapxR(i,j)+ &
+                  SlideLambda)*abs(HaxR(i,j)))
+      SQR_PHI_S = 0.5*(SQR_PHI_L+SQR_PHI_R)+0.25*(UaxL(i,j)-UaxR(i,j))
+      U_S = 0.5*(UaxL(i,j)+UaxR(i,j))+SQR_PHI_L-SQR_PHI_R
+      SaxL(i,j) = min(UaxL(i,j)-SQR_PHI_L,U_S-SQR_PHI_S)
+      SaxR(i,j) = max(UaxR(i,j)+SQR_PHI_R,U_S+SQR_PHI_S)
+      SaxS(i,j) = U_S
+    enddo
+    enddo
+
+    do j = Jbeg,Jend1
+    do i = Ibeg,Iend
+      CosAlpha = 0.5*(CosAng(i,j)+CosAng(i,j-1))
+      SQR_PHI_L = sqrt(Grav*CosAlpha*((1.0-SlideLambda)*KapyL(i,j)+ &
+                  SlideLambda)*abs(HayL(i,j)))
+      SQR_PHI_R = sqrt(Grav*CosAlpha*((1.0-SlideLambda)*KapyR(i,j)+ &
+                  SlideLambda)*abs(HayR(i,j)))
+      SQR_PHI_S = 0.5*(SQR_PHI_L+SQR_PHI_R)+0.25*(VayL(i,j)-VayR(i,j))
+      U_S = 0.5*(VayL(i,j)+VayR(i,j))+SQR_PHI_L-SQR_PHI_R
+      SayL(i,j) = min(VayL(i,j)-SQR_PHI_L,U_S-SQR_PHI_S)
+      SayR(i,j) = max(VayR(i,j)+SQR_PHI_R,U_S+SQR_PHI_S)
+      SayS(i,j) = U_S
+    enddo
+    enddo
+
+    end subroutine wave_speed_ll
+
+
+    subroutine fluxes_at_faces_HLL_ll
+    use global
+    implicit none
+    integer :: i,j
+
+    ! horizontal fluxes
+    call HLL2D(Mloc1,Nloc,SaxL,SaxR,EaxL,EaxR,HaxL,HaxR,Eax)
+    call HLL2D(Mloc,Nloc1,SayL,SayR,EayL,EayR,HayL,HayR,Eay)
+    call HLL2D(Mloc1,Nloc,SaxL,SaxR,FaxL,FaxR,HUaxL,HUaxR,Fax)
+    call HLL2D(Mloc,Nloc1,SayL,SayR,FayL,FayR,HUayL,HUayR,Fay)
+    call HLL2D(Mloc1,Nloc,SaxL,SaxR,GaxL,GaxR,HVaxL,HVaxR,Gax)
+    call HLL2D(Mloc,Nloc1,SayL,SayR,GayL,GayR,HVayL,HVayR,Gay)
+
+    end subroutine fluxes_at_faces_HLL_ll
+
+
+    subroutine HLL2D(M,N,SL,SR,FL,FR,UL,UR,FOUT)
+    use global, only: SP,ZERO,SMALL
+    implicit none
+    INTEGER,INTENT(IN)::M,N
+    REAL(SP),INTENT(IN),DIMENSION(M,N)::SL,SR,FL,FR,UL,UR
+    REAL(SP),INTENT(OUT),DIMENSION(M,N)::FOUT
+    INTEGER :: I,J
+
+    DO J = 1,N
+    DO I = 1,M
+      IF(SL(I,J)>=ZERO) THEN
+        FOUT(I,J) = FL(I,J)
+      ELSEIF(SR(I,J)<=ZERO) THEN
+        FOUT(I,J) = FR(I,J)
+      ELSE
+        FOUT(I,J) = SR(I,J)*FL(I,J)-SL(I,J)*FR(I,J)+  &
+              SL(I,J)*SR(I,J)*(UR(I,J)-UL(I,J))
+        IF((ABS(SR(I,J)-SL(I,J)))<SMALL)THEN
+          FOUT(I,J) = FOUT(I,J)/SMALL
+        ELSE
+          FOUT(I,J) = FOUT(I,J)/(SR(I,J)-SL(I,J))
+        ENDIF
+      ENDIF
+    ENDDO
+    ENDDO
+
+    return
+    end subroutine HLL2D
+
+# endif
 !------------------------The End----------------------------------------------

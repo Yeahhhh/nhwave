@@ -1,0 +1,168 @@
+
+DEFAULT_SHELL := $(shell which sh)
+DEFAULT_CPP := $(shell which cpp)
+DEFAULT_FC := $(shell which gfortran)
+
+DEFAULT_CPPFLAGS += -P
+DEFAULT_CPPFLAGS += -C
+DEFAULT_CPPFLAGS += -traditional
+
+DEFAULT_BIN_NAME := nhwave
+DEFAULT_BIN_PREFIX :=
+DEFAULT_BIN_SUFFIX :=
+
+DEFAULT_FFLAGS := -O0 -g
+DEFAULT_FFLAGS_HOT := -fast
+DEFAULT_LDFLAGS := -fast
+
+
+
+# make command line option
+CREATE_CONFIG ?=
+
+ifneq ($(strip $(CREATE_CONFIG)),)
+
+all:
+	@mkdir -p config
+	@(                                                   \
+		echo                                        ;\
+		echo 'SHELL ?= $$(DEFAULT_SHELL)'           ;\
+		echo                                        ;\
+		echo 'CPP ?= $$(DEFAULT_CPP)'               ;\
+		echo 'CPPFLAGS ?= $$(DEFAULT_CPPFLAGS)'     ;\
+		echo                                        ;\
+		echo 'FC ?= $$(DEFAULT_FC)'                 ;\
+		echo 'FFLAGS ?= $$(DEFAULT_FFLAGS)'         ;\
+		echo                                        ;\
+		echo 'LDFLAGS ?= '                          ;\
+		echo                                        ;\
+		echo 'BIN_NAME ?= $$(DEFAULT_BIN_NAME)'     ;\
+		echo 'BIN_PREFIX ?= $$(DEFAULT_BIN_PREFIX)' ;\
+		echo 'BIN_SUFFIX ?= $$(DEFAULT_BIN_SUFFIX)' ;\
+		echo                                        ;\
+		echo 'OPTIONS += -DDOUBLE_PRECISION'        ;\
+		echo 'OPTIONS += -DPARALLEL'                ;\
+		echo 'OPTIONS += -DLANDSLIDE'               ;\
+		echo 'OPTIONS += -DSALINITY'                ;\
+		echo 'OPTIONS += -DTEMPERATURE'             ;\
+		echo 'OPTIONS += -DBUBBLE'                  ;\
+		echo 'OPTIONS += -DSEDIMENT'                ;\
+		echo 'OPTIONS += -DVEGETATION'              ;\
+		echo 'OPTIONS += -DINTEL'                   ;\
+		echo 'OPTIONS += -DBALANCE2D'               ;\
+		echo 'OPTIONS += -DTWOLAYERSLIDE'           ;\
+		echo 'OPTIONS += -DCORALREEF'               ;\
+		echo                                        ;\
+		echo 'HYPRE_FFLAGS ?= '                     ;\
+		echo 'LDFLAGS +=  '                         ;\
+		echo 'LIBS += '                             ;\
+		echo                                        ;\
+	) > config/$(CREATE_CONFIG).mk
+
+else
+
+CONFIG ?= default
+
+BUILD_DIR := ../build/$(CONFIG)
+
+include config/$(CONFIG).mk
+
+
+
+
+
+
+
+SRC_MODS += mod_global.F mod_util.F mod_timing.f90
+SRC_HOTSPOT_F += hotspot_generate_coef_rhs.F
+SRC_HOTSPOT_F += hotspot_hypre_pres_solver.F
+SRC_HOTSPOT_F += hotspot_delxyzFun.F
+SRCS += $(SRC_MODS) $(SRC_HOTSPOT_F) nhware.F
+
+
+SRC_TMP := $(shell                                        \
+                 echo $(SRCS:.F=.f90) $(wildcard *.f90) | \
+                 sed 's/ /\n/g'                         | \
+                 sed 's$$\(.*\)$$$(BUILD_DIR)/\1$$g'    | \
+                 sort -u                                  \
+            )
+
+OBJ_MODS := $(shell                                   \
+                 echo $(SRC_MODS:.F=.o)              |\
+                 sed 's/ /\n/g'                      |\
+                 sed 's$$\(.*\)$$$(BUILD_DIR)/\1$$g' |\
+                 sort -u                              \
+             )
+
+OBJS := $(SRC_TMP:.f90=.o)
+
+BIN := $(BUILD_DIR)/$(BIN_PREFIX)$(BIN_NAME)$(BIN_SUFFIX)
+
+.INTERMEDIATE: $(SRC_TMP)
+
+
+
+
+
+all: $(BIN)
+
+$(BIN): $(OBJ_MODS) $(OBJS)
+	@echo '[LINK]' $(shell basename $@)
+	@(                                               \
+		cd $(BUILD_DIR)                         ;\
+		myexe=$(shell basename $@)              ;\
+		$(FC) $(LDFLAGS) *.o -o $(myexe) $(LIBS)
+	)
+	$(shell ln -s -f $@ $(BIN_NAME))
+
+$(BUILD_DIR)/%.f90: %.F $(BUILD_DIR)
+	@echo '[CPP ]' $(shell basename $^)
+	@$(CPP) $(CPPFLAGS) $(OPTIONS) $< -o $@
+
+$(BUILD_DIR)/%.f90: %.f90 $(BUILD_DIR)
+	@echo '[COPY]' $< $@
+	@cp $< $@
+
+$(BUILD_DIR)/%.o: $(BUILD_DIR)/%.f90 $(BUILD_DIR)
+	@echo '[FC  ]' $(shell basename $^)
+	@(                                                       \
+		cd $(BUILD_DIR)                                 ;\
+		mysrc=$(shell basename $<)			;\
+		myobj=$(shell basename $@)			;\
+		$(FC) -c $(FFLAGS) $(HYPRE_FFLAGS) $(mysrc) $(myobj)
+	)
+
+
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+clean-all:
+	rm -rf build/*/
+
+test:
+	@mkdir -p logs
+	@(                           \
+		set -e                  ;\
+		source env/$(CONFIG).sh ;\
+		make CONFIG=$(CONFIG)   ;\
+		source run/$(CONFIG).sh  \
+	) 2>&1 | tee logs/$(CONFIG).log
+
+help:
+	@(                                \
+	echo 'make CREATE_CONFIG=xxx'    ;\
+	echo 'make CONFIG=xxx'           ;\
+	echo 'make <VAR_OVERRIDE>=xxx'   ;\
+	)
+
+
+endif
+
+
+.SUFFIXES: .o .f90 .F
+.PHONY: all clean clean-config test
+
